@@ -128,7 +128,7 @@ Neo4j stores `(Account)-[:TRANSFER]->(Account)` relationships and powers one- an
 - Neo4j for account relationships and graph neighborhood queries
 - Vercel Functions for the same-origin React/FastAPI deployment and Supabase Postgres for durable production data
 
-The root `vercel.json` builds the Vite frontend and routes `/api/*` to the FastAPI ASGI function. Production uses same-origin requests, secure cookies, a private `mads` Postgres schema, Supabase transaction pooling, and encrypted Vercel environment variables. Never create a `VITE_` variable for `DATABASE_URL`, `SECRET_KEY`, or speech-provider credentials: `VITE_` values are embedded into browser bundles. The legacy `render.yaml` remains available for self-hosted/container deployments.
+The root `vercel.json` builds the Vite frontend and routes `/api/*` to the FastAPI ASGI function. Production uses same-origin requests, secure cookies, a private `mads` Postgres schema, Supabase transaction pooling, and encrypted Vercel environment variables. Never create a `VITE_` variable for `DATABASE_URL`, `SECRET_KEY`, or speech-provider credentials: `VITE_` values are embedded into browser bundles. The Docker Compose configuration remains available for self-hosted deployments.
 
 ## Detection method
 
