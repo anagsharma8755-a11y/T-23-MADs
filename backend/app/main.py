@@ -1,6 +1,7 @@
-import csv, io, json, secrets, tempfile, shutil, html
+import csv, io, json, secrets, tempfile, shutil, html, time, os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Request, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -16,6 +17,7 @@ from .detection import analyze, score_findings, DEFAULTS
 from .demo import demo_csvs
 from .graph_store import graph_store
 from .elliptic import import_elliptic, evaluation as elliptic_evaluation, FILES as ELLIPTIC_FILES
+from .voice_assistant import execute_command as execute_assistant_command, speech_provider, synthesize_speech
 
 app=FastAPI(title="MADs API",version="1.0.0",description="Workspace-scoped, explainable transaction-network investigation API")
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(",")],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
@@ -29,8 +31,41 @@ class RegisterBody(BaseModel):
 class DecisionBody(BaseModel): status:str; note:str|None=None
 class SettingsBody(BaseModel): config:dict
 class UserBody(BaseModel): email:str; name:str; password:str; role:str="analyst"
+class AssistantContext(BaseModel):
+    domain: str = Field(pattern="^(bank|elliptic)$")
+    dataset_id: int
+    run_id: int|None = None
+    wallet_id: str|None = Field(default=None, max_length=180)
+class AssistantCommandBody(BaseModel):
+    request_id: str = Field(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9._:-]+$")
+    text: str = Field(min_length=1, max_length=800)
+    context: AssistantContext
+class AssistantSpeakBody(BaseModel):
+    text: str = Field(min_length=1, max_length=800)
+class HoneypotSessionBody(BaseModel):
+    name: str = Field(min_length=3,max_length=180)
+    decoy_profile: str = Field(default="payment_portal",pattern="^(payment_portal|wallet_console|kyc_portal)$")
+class HoneypotEventBody(BaseModel):
+    event_type: str = Field(pattern="^(login_failure|account_enumeration|transfer_attempt|automation_signal|privileged_action)$")
+    source_alias: str = Field(min_length=1,max_length=120)
+    target_alias: str = Field(default="decoy-account",min_length=1,max_length=120)
+    amount: float|None = Field(default=None,ge=0,le=1_000_000_000)
+    currency: str|None = Field(default=None,min_length=3,max_length=12)
+class HoneypotStatusBody(BaseModel):
+    status: str = Field(pattern="^(monitoring|escalated|closed)$")
+    note: str = Field(min_length=10,max_length=1000)
+
+_assistant_requests: dict[int,list[float]] = {}
+def assistant_rate_limit(user:User):
+    now=time.monotonic(); recent=[x for x in _assistant_requests.get(user.id,[]) if now-x<60]
+    if len(recent)>=settings.assistant_requests_per_minute: raise HTTPException(429,"Assistant request limit reached. Try again shortly.")
+    recent.append(now); _assistant_requests[user.id]=recent
 
 def audit(db,user,action,target_type,target_id,details=None): db.add(AuditEvent(workspace_id=user.workspace_id,user_id=user.id,action=action,target_type=target_type,target_id=str(target_id),details=details or {}))
+def scoped_honeypot(db,id,user):
+    obj=db.scalar(select(HoneypotSession).where(HoneypotSession.id==id,HoneypotSession.workspace_id==user.workspace_id))
+    if not obj: raise HTTPException(404,"Honeypot session not found")
+    return obj
 def scoped_dataset(db,id,user):
     obj=db.scalar(select(Dataset).where(Dataset.id==id,Dataset.workspace_id==user.workspace_id))
     if not obj: raise HTTPException(404,"Dataset not found")
@@ -48,6 +83,19 @@ def latest_settings(db,user):
     if not row:
         row=DetectionSettings(workspace_id=user.workspace_id,version=1,config=DEFAULTS,created_by=user.id); db.add(row); db.commit(); db.refresh(row)
     return row
+
+def validated_detection_config(value:dict):
+    merged={**DEFAULTS,**value}
+    ranges={"fan_window_minutes":(1,1440),"fan_min_senders":(2,100),"fan_min_receivers":(1,100),"fan_share":(0.1,1.0),"cycle_window_hours":(1,720),"cycle_max_length":(3,8),"chain_window_minutes":(1,1440),"chain_min_share":(0.1,1.0),"new_account_days":(1,3650),"shared_min_accounts":(2,100),"medium_risk_score":(1,99),"high_risk_score":(2,100)}
+    unknown=set(merged)-set(ranges)
+    if unknown: raise HTTPException(422,"Unknown detection settings: "+", ".join(sorted(unknown)))
+    for name,(low,high) in ranges.items():
+        number=merged.get(name)
+        if not isinstance(number,(int,float)) or isinstance(number,bool) or number<low or number>high:
+            raise HTTPException(422,f"{name} must be between {low} and {high}")
+    if merged["medium_risk_score"]>=merged["high_risk_score"]:
+        raise HTTPException(422,"medium_risk_score must be lower than high_risk_score")
+    return merged
 
 @app.exception_handler(ValueError)
 async def value_error(_,exc): return __import__("fastapi").responses.JSONResponse(status_code=422,content={"detail":str(exc)})
@@ -90,6 +138,38 @@ def logout(request:Request,response:Response,user:User=Depends(require_csrf),db:
 @app.get("/api/auth/me")
 def me(user:User=Depends(current_user)): return {"id":user.id,"email":user.email,"name":user.name,"role":user.role,"workspace_id":user.workspace_id}
 
+@app.get("/api/assistant/status")
+def assistant_status(user:User=Depends(current_user)):
+    provider=settings.speech_provider.lower()
+    credentials=bool(settings.elevenlabs_api_key) if provider=="elevenlabs" else bool(settings.speech_api_key)
+    return {"speech_available":provider in {"openai","elevenlabs"} and credentials,"voice_available":provider=="elevenlabs" and credentials,"speech_provider":provider if provider!="disabled" else None,"max_recording_seconds":settings.assistant_max_recording_seconds,"max_audio_bytes":settings.assistant_max_audio_bytes,"privacy_notice":"Audio is sent only to the configured speech provider and is not retained by MADs."}
+
+@app.post("/api/assistant/command")
+def assistant_command(body:AssistantCommandBody,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
+    assistant_rate_limit(user)
+    try:
+        return execute_assistant_command(db,user,body.request_id,body.text,body.context.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
+
+@app.post("/api/assistant/transcribe")
+async def assistant_transcribe(file:UploadFile=File(...),user:User=Depends(require_csrf)):
+    assistant_rate_limit(user)
+    allowed={"audio/webm","audio/ogg","audio/wav","audio/x-wav","audio/mpeg","audio/mp4","audio/m4a"}
+    content_type=(file.content_type or "").split(";",1)[0].lower()
+    if content_type not in allowed: raise HTTPException(415,"Unsupported audio type. Use WebM, OGG, WAV, MP3, M4A, or MP4.")
+    raw=await file.read(settings.assistant_max_audio_bytes+1)
+    if not raw: raise HTTPException(422,"The recording is empty")
+    if len(raw)>settings.assistant_max_audio_bytes: raise HTTPException(413,"Recording exceeds the assistant upload limit")
+    text=await speech_provider().transcribe(raw,file.filename or "recording.webm",content_type)
+    return {"text":text,"retained":False}
+
+@app.post("/api/assistant/speak")
+async def assistant_speak(body:AssistantSpeakBody,user:User=Depends(require_csrf)):
+    assistant_rate_limit(user)
+    audio,media_type=await synthesize_speech(body.text)
+    return Response(content=audio,media_type=media_type,headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
 @app.post("/api/uploads/preview")
 async def preview(file:UploadFile=File(...),user:User=Depends(require_csrf)):
     raw=await file.read(settings.max_upload_bytes+1)
@@ -123,8 +203,10 @@ async def import_dataset(name,tx_file,account_file,user,db):
         return dataset
     except Exception: db.rollback(); raise
 @app.post("/api/datasets")
-async def upload_dataset(name:str=Form(...),transactions:UploadFile=File(...),accounts:UploadFile|None=File(None),user:User=Depends(require_csrf),db:Session=Depends(get_db)):
-    d=await import_dataset(name,transactions,accounts,user,db); return {"id":d.id,"name":d.name,"transaction_count":d.transaction_count,"account_count":d.account_count}
+async def upload_dataset(background:BackgroundTasks,name:str=Form(...),transactions:UploadFile=File(...),accounts:UploadFile|None=File(None),user:User=Depends(require_csrf),db:Session=Depends(get_db)):
+    d=await import_dataset(name,transactions,accounts,user,db)
+    cfg=latest_settings(db,user); run=AnalysisRun(dataset_id=d.id,settings_id=cfg.id,status="queued",progress=0,created_by=user.id); db.add(run); db.flush(); audit(db,user,"analysis.start","analysis_run",run.id,{"dataset_id":d.id,"settings_version":cfg.version,"trigger":"automatic_after_csv_import"}); db.commit(); dispatch_analysis(run.id,background); db.refresh(run)
+    return {"id":d.id,"name":d.name,"transaction_count":d.transaction_count,"account_count":d.account_count,"run_id":run.id,"analysis_status":run.status}
 @app.get("/api/datasets")
 def datasets(user:User=Depends(current_user),db:Session=Depends(get_db)): return [{"id":d.id,"name":d.name,"transaction_count":d.transaction_count,"account_count":d.account_count,"created_at":d.created_at} for d in db.scalars(select(Dataset).where(Dataset.workspace_id==user.workspace_id).order_by(Dataset.created_at.desc())).all()]
 @app.get("/api/datasets/{dataset_id}/summary")
@@ -134,7 +216,69 @@ def summary(dataset_id:int,user:User=Depends(current_user),db:Session=Depends(ge
     activity=db.execute(select(func.date(Transaction.timestamp),func.count(Transaction.id)).where(Transaction.dataset_id==d.id).group_by(func.date(Transaction.timestamp)).order_by(func.date(Transaction.timestamp))).all()
     shared_available=any(a.created_at and (a.device_id or a.ip_address or a.kyc_group_id) for a in accts)
     availability={"rapid_fan":{"available":True},"circular":{"available":True},"pass_through":{"available":True},"shared_attribute":{"available":shared_available,"reason":None if shared_available else "Requires account creation dates plus device, IP, or synthetic KYC metadata."}}
-    return {"dataset":{"id":d.id,"name":d.name,"transaction_count":d.transaction_count,"account_count":d.account_count},"run_id":run.id if run else None,"flagged_accounts":len(scores),"high_risk":sum(s.severity=="High" for s in scores),"awaiting_review":sum(s.review_status in ("unreviewed","under_review") for s in scores),"confirmed":sum(s.review_status=="confirmed_suspicious" for s in scores),"cleared":sum(s.review_status=="cleared" for s in scores),"totals":[{"currency":c,"amount":float(a)} for c,a in totals],"activity":[{"date":str(day),"count":count} for day,count in activity],"patterns":[{"name":detector.replace("_"," ").title(),"value":count} for detector,count in patterns],"detector_availability":availability}
+    return {"dataset":{"id":d.id,"name":d.name,"filename":d.filename,"account_filename":d.account_filename,"transaction_count":d.transaction_count,"account_count":d.account_count,"created_at":d.created_at},"run_id":run.id if run else None,"flagged_accounts":len(scores),"high_risk":sum(s.severity=="High" for s in scores),"awaiting_review":sum(s.review_status in ("unreviewed","under_review") for s in scores),"confirmed":sum(s.review_status=="confirmed_suspicious" for s in scores),"cleared":sum(s.review_status=="cleared" for s in scores),"totals":[{"currency":c,"amount":float(a)} for c,a in totals],"activity":[{"date":str(day),"count":count} for day,count in activity],"patterns":[{"name":detector.replace("_"," ").title(),"value":count} for detector,count in patterns],"detector_availability":availability}
+
+@app.get("/api/datasets/{dataset_id}/transactions")
+def dataset_transactions(dataset_id:int,page:int=1,page_size:int=50,q:str="",user:User=Depends(current_user),db:Session=Depends(get_db)):
+    d=scoped_dataset(db,dataset_id,user); page=max(1,page); page_size=min(max(1,page_size),100)
+    stmt=select(Transaction).where(Transaction.dataset_id==d.id)
+    if q: stmt=stmt.where(or_(Transaction.transaction_id.contains(q),Transaction.sender_account.contains(q),Transaction.receiver_account.contains(q)))
+    total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows=db.scalars(stmt.order_by(Transaction.timestamp.desc(),Transaction.id.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    return {"items":[{"transaction_id":x.transaction_id,"timestamp":x.timestamp,"sender_account":x.sender_account,"receiver_account":x.receiver_account,"amount":float(x.amount),"currency":x.currency} for x in rows],"total":total,"page":page,"page_size":page_size,"source_filename":d.filename}
+
+HONEYPOT_RULES={
+    "login_failure":(8,"Low","Repeated authentication failure against the isolated decoy."),
+    "account_enumeration":(18,"Medium","Sequential account discovery behavior targeted the decoy interface."),
+    "transfer_attempt":(28,"High","A transfer was attempted inside the non-settling decoy environment."),
+    "automation_signal":(22,"Medium","Interaction timing matched automated probing of the decoy."),
+    "privileged_action":(38,"High","A privileged decoy action was attempted without an authorized workflow."),
+}
+def honeypot_payload(session:HoneypotSession,db:Session):
+    events=db.scalars(select(HoneypotEvent).where(HoneypotEvent.session_id==session.id).order_by(HoneypotEvent.created_at.desc(),HoneypotEvent.id.desc())).all()
+    return {"session":{"id":session.id,"name":session.name,"decoy_profile":session.decoy_profile,"status":session.status,"risk_score":session.risk_score,"event_count":session.event_count,"created_at":session.created_at,"updated_at":session.updated_at},"events":[{"id":e.id,"event_type":e.event_type,"source_alias":e.source_alias,"target_alias":e.target_alias,"severity":e.severity,"contribution":e.contribution,"reason":e.reason,"metadata":e.metadata_json,"created_at":e.created_at} for e in events],"notice":"Isolated defensive sandbox. Events are persisted and scored; no real transaction is executed and no external account is contacted."}
+
+@app.get("/api/honeypot/sessions")
+def honeypot_sessions(user:User=Depends(current_user),db:Session=Depends(get_db)):
+    rows=db.scalars(select(HoneypotSession).where(HoneypotSession.workspace_id==user.workspace_id).order_by(HoneypotSession.updated_at.desc())).all()
+    return [{"id":x.id,"name":x.name,"decoy_profile":x.decoy_profile,"status":x.status,"risk_score":x.risk_score,"event_count":x.event_count,"created_at":x.created_at,"updated_at":x.updated_at} for x in rows]
+
+@app.post("/api/honeypot/sessions")
+def create_honeypot_session(body:HoneypotSessionBody,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
+    obj=HoneypotSession(workspace_id=user.workspace_id,name=body.name.strip(),decoy_profile=body.decoy_profile,created_by=user.id)
+    db.add(obj);db.flush();audit(db,user,"honeypot.session_created","honeypot_session",obj.id,{"profile":obj.decoy_profile});db.commit();db.refresh(obj)
+    return honeypot_payload(obj,db)
+
+@app.get("/api/honeypot/sessions/{session_id}")
+def honeypot_session_detail(session_id:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    return honeypot_payload(scoped_honeypot(db,session_id,user),db)
+
+@app.post("/api/honeypot/sessions/{session_id}/events")
+def record_honeypot_event(session_id:int,body:HoneypotEventBody,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
+    session=scoped_honeypot(db,session_id,user)
+    if session.status=="closed": raise HTTPException(409,"Closed honeypot sessions cannot accept events")
+    base,severity,reason=HONEYPOT_RULES[body.event_type]
+    recent_since=datetime.now(timezone.utc)-timedelta(minutes=5)
+    recent=db.scalar(select(func.count(HoneypotEvent.id)).where(HoneypotEvent.session_id==session.id,HoneypotEvent.event_type==body.event_type,HoneypotEvent.created_at>=recent_since)) or 0
+    burst_bonus=12 if recent>=2 else 0
+    if burst_bonus: reason+=f" Burst threshold crossed: {recent+1} matching events within five minutes."
+    contribution=min(50,base+burst_bonus)
+    metadata={"amount":body.amount,"currency":body.currency.upper() if body.currency else None,"sandboxed":True}
+    event=HoneypotEvent(session_id=session.id,event_type=body.event_type,source_alias=body.source_alias.strip(),target_alias=body.target_alias.strip(),severity=severity,contribution=contribution,reason=reason,metadata_json=metadata)
+    db.add(event);session.event_count+=1;session.risk_score=min(100,session.risk_score+contribution);session.updated_at=datetime.now(timezone.utc)
+    if session.risk_score>=60: session.status="escalated"
+    db.flush();audit(db,user,"honeypot.event_recorded","honeypot_event",event.id,{"session_id":session.id,"event_type":event.event_type,"contribution":contribution});db.commit();db.refresh(session)
+    return honeypot_payload(session,db)
+
+@app.post("/api/honeypot/sessions/{session_id}/status")
+def set_honeypot_status(session_id:int,body:HoneypotStatusBody,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
+    session=scoped_honeypot(db,session_id,user);session.status=body.status;session.updated_at=datetime.now(timezone.utc);audit(db,user,"honeypot.status_changed","honeypot_session",session.id,{"status":body.status,"note":body.note});db.commit();db.refresh(session);return honeypot_payload(session,db)
+
+@app.get("/api/honeypot/sessions/{session_id}/report",response_class=HTMLResponse)
+def honeypot_report(session_id:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    data=honeypot_payload(scoped_honeypot(db,session_id,user),db);s=data["session"]
+    rows="".join(f"<tr><td>{html.escape(str(e['created_at']))}</td><td>{html.escape(e['event_type'].replace('_',' ').title())}</td><td>{html.escape(e['source_alias'])}</td><td>{html.escape(e['target_alias'])}</td><td>{e['contribution']}</td><td>{html.escape(e['reason'])}</td></tr>" for e in data["events"])
+    return f"""<!doctype html><title>MADs Honeypot Evidence Report</title><style>body{{font:14px Arial;margin:32px;color:#11162d}}table{{border-collapse:collapse;width:100%}}th,td{{padding:9px;border:1px solid #d8d5ce;text-align:left}}th{{background:#11162d;color:white}}button{{padding:9px 14px;background:#b779ef;border:0;border-radius:8px;font-weight:bold}}@media print{{button{{display:none}}}}</style><button onclick='print()'>Print / save PDF</button><h1>MADs honeypot evidence report</h1><p><b>{html.escape(s['name'])}</b> · Profile {html.escape(s['decoy_profile'])} · Status {html.escape(s['status'])}</p><p>Risk score: <b>{s['risk_score']}/100</b> · Persisted events: <b>{s['event_count']}</b></p><p>This is an isolated defensive sandbox. No real transaction was executed and no external account was contacted.</p><table><tr><th>Time</th><th>Event</th><th>Source alias</th><th>Target alias</th><th>Risk +</th><th>Why flagged</th></tr>{rows}</table>"""
 
 def execute_analysis(run_id:int):
     db=SessionLocal()
@@ -145,19 +289,27 @@ def execute_analysis(run_id:int):
         txs=db.scalars(select(Transaction).where(Transaction.dataset_id==run.dataset_id)).all(); accts=db.scalars(select(Account).where(Account.dataset_id==run.dataset_id)).all(); cfg=db.get(DetectionSettings,run.settings_id).config
         found=analyze(txs,accts,cfg); run.progress=65; db.commit(); objs=[]
         for f in found: obj=Finding(run_id=run.id,**f); db.add(obj); objs.append(obj)
-        db.flush(); scored=score_findings(found)
+        db.flush(); scored=score_findings(found,cfg)
         for account,data in scored.items(): db.add(AccountScore(run_id=run.id,account_id=account,score=data["score"],severity=data["severity"],breakdown=data["breakdown"],finding_ids=[objs[i].id for i in data["finding_indexes"]]))
         run.status="completed"; run.progress=100; run.completed_at=datetime.now(timezone.utc); db.commit()
     except Exception as e:
         db.rollback(); run=db.get(AnalysisRun,run_id)
         if run: run.status="failed"; run.error=str(e); db.commit()
     finally: db.close()
+
+def dispatch_analysis(run_id:int, background:BackgroundTasks):
+    # A Vercel function may be frozen after its response is returned. Run the
+    # bounded analysis in the request invocation so CSV imports are durable.
+    if os.getenv("VERCEL"):
+        execute_analysis(run_id)
+    else:
+        background.add_task(execute_analysis,run_id)
 @app.post("/api/datasets/{dataset_id}/analyses")
 def start_analysis(dataset_id:int,background:BackgroundTasks,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
-    d=scoped_dataset(db,dataset_id,user); cfg=latest_settings(db,user); run=AnalysisRun(dataset_id=d.id,settings_id=cfg.id,status="queued",progress=0,created_by=user.id); db.add(run); db.flush(); audit(db,user,"analysis.start","analysis_run",run.id,{"dataset_id":d.id,"settings_version":cfg.version}); db.commit(); background.add_task(execute_analysis,run.id); return {"job_id":run.id,"status":"queued"}
+    d=scoped_dataset(db,dataset_id,user); cfg=latest_settings(db,user); run=AnalysisRun(dataset_id=d.id,settings_id=cfg.id,status="queued",progress=0,created_by=user.id); db.add(run); db.flush(); audit(db,user,"analysis.start","analysis_run",run.id,{"dataset_id":d.id,"settings_version":cfg.version}); db.commit(); dispatch_analysis(run.id,background); db.refresh(run); return {"job_id":run.id,"status":run.status}
 @app.post("/api/analyses/{run_id}/retry")
 def retry(run_id:int,background:BackgroundTasks,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
-    run=scoped_run(db,run_id,user); run.status="queued"; run.error=None; run.progress=0; db.commit(); background.add_task(execute_analysis,run.id); return {"job_id":run.id,"status":"queued"}
+    run=scoped_run(db,run_id,user); run.status="queued"; run.error=None; run.progress=0; db.commit(); dispatch_analysis(run.id,background); db.refresh(run); return {"job_id":run.id,"status":run.status}
 @app.get("/api/analyses/{run_id}")
 def analysis_status(run_id:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
     r=scoped_run(db,run_id,user); s=db.get(DetectionSettings,r.settings_id); return {"id":r.id,"dataset_id":r.dataset_id,"status":r.status,"progress":r.progress,"error":r.error,"settings_version":s.version,"created_at":r.created_at,"completed_at":r.completed_at}
@@ -182,7 +334,7 @@ def account_detail(run_id:int,account_id:str,user:User=Depends(current_user),db:
 def decide(run_id:int,account_id:str,body:DecisionBody,user:User=Depends(require_csrf),db:Session=Depends(get_db)):
     scoped_run(db,run_id,user); allowed={x.value for x in ReviewStatus}
     if body.status not in allowed: raise HTTPException(422,"Invalid review status")
-    if body.status in {"confirmed_suspicious","cleared"} and not (body.note and body.note.strip()): raise HTTPException(422,"A note is required when confirming or clearing")
+    if body.status in {"confirmed_suspicious","cleared"} and not (body.note and len(body.note.strip())>=10): raise HTTPException(422,"A written rationale of at least 10 characters is required when confirming or clearing")
     score=db.scalar(select(AccountScore).where(AccountScore.run_id==run_id,AccountScore.account_id==account_id))
     if not score: raise HTTPException(404,"Flagged account not found")
     score.review_status=body.status; d=Decision(score_id=score.id,status=body.status,note=body.note,user_id=user.id); db.add(d); audit(db,user,"decision.change","account_score",score.id,{"account_id":account_id,"status":body.status}); db.commit(); return {"ok":True,"status":body.status}
@@ -225,6 +377,18 @@ def export(run_id:int,format:str="csv",user:User=Depends(current_user),db:Sessio
         related=[f for f in findings if f.id in s.finding_ids]; data.append({"account_id":s.account_id,"risk_score":s.score,"severity":s.severity,"review_status":s.review_status,"reasons":" | ".join(f.reason for f in related),"supporting_transactions":" | ".join(t for f in related for t in f.transaction_ids)})
     if format=="json": return data
     out=io.StringIO(); w=csv.DictWriter(out,fieldnames=list(data[0].keys()) if data else ["account_id","risk_score","severity","review_status","reasons","supporting_transactions"]); w.writeheader(); w.writerows([{k:safe_cell(v) for k,v in r.items()} for r in data]); return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=muletrace-run-{run_id}.csv"})
+@app.get("/api/analyses/{run_id}/report",response_class=HTMLResponse)
+def full_report(run_id:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    run=scoped_run(db,run_id,user); dataset=db.get(Dataset,run.dataset_id); cfg=db.get(DetectionSettings,run.settings_id)
+    scores_=db.scalars(select(AccountScore).where(AccountScore.run_id==run_id).order_by(AccountScore.score.desc(),AccountScore.account_id)).all(); findings=db.scalars(select(Finding).where(Finding.run_id==run_id)).all(); finding_map={f.id:f for f in findings}
+    rows=[]
+    for score in scores_:
+        related=[finding_map[x] for x in score.finding_ids if x in finding_map]
+        reasons="<br>".join(html.escape(f.reason) for f in related) or "No explanation recorded"
+        txids=sorted({tx for f in related for tx in f.transaction_ids})
+        rows.append(f"<tr><td><a href='/api/analyses/{run_id}/report/{html.escape(quote(score.account_id,safe=''))}'>{html.escape(score.account_id)}</a></td><td>{score.score}</td><td>{html.escape(score.severity)}</td><td>{html.escape(score.review_status)}</td><td>{reasons}</td><td>{len(txids)}</td></tr>")
+    settings_text=html.escape(json.dumps({**DEFAULTS,**cfg.config},sort_keys=True))
+    return f"""<!doctype html><title>MADs Complete Analysis Report</title><style>body{{font:14px Arial;margin:32px;color:#11162d}}h1{{margin-bottom:4px}}.notice{{padding:14px;background:#f1ebff;border-radius:10px}}table{{border-collapse:collapse;width:100%;margin-top:18px}}th,td{{padding:8px;border:1px solid #d8d5ce;text-align:left;vertical-align:top}}th{{background:#11162d;color:white;position:sticky;top:0}}td:nth-child(5){{min-width:420px}}button,a.export{{display:inline-block;padding:9px 14px;margin-right:8px;border:0;border-radius:8px;background:#a96bec;color:#11162d;font-weight:bold;text-decoration:none}}@media print{{button,a.export{{display:none}}th{{position:static}}}}</style><button onclick='print()'>Print / save PDF</button><a class='export' href='/api/analyses/{run_id}/export?format=csv'>Export CSV</a><h1>MADs complete analysis report</h1><p>Dataset: <b>{html.escape(dataset.name)}</b> · Source file: <b>{html.escape(dataset.filename)}</b> · Run #{run.id} · Settings v{cfg.version}</p><p class='notice'><b>{dataset.transaction_count:,}</b> imported CSV transactions were analyzed. <b>{len(scores_):,}</b> accounts produced at least one explainable signal. Scores prioritize review and are not probabilities of fraud.</p><p><b>Strict detector parameters:</b> <code>{settings_text}</code></p><table><thead><tr><th>Account</th><th>Score</th><th>Severity</th><th>Analyst status</th><th>Why flagged</th><th>Supporting transactions</th></tr></thead><tbody>{''.join(rows)}</tbody></table><p>Generated from imported records only. Every row links to its detailed evidence report and decision history.</p>"""
 @app.get("/api/analyses/{run_id}/report/{account_id}",response_class=HTMLResponse)
 def report(run_id:int,account_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     detail=account_detail(run_id,account_id,user,db); run=db.get(AnalysisRun,run_id); dataset=db.get(Dataset,run.dataset_id); cfg=db.get(DetectionSettings,run.settings_id); reasons="".join(f"<li><b>{f['detector']}</b>: {f['reason']}<br><small>{'; '.join(f['limitations'])}</small></li>" for f in detail["findings"]); txrows="".join(f"<tr><td>{t['transaction_id']}</td><td>{t['timestamp']}</td><td>{t['sender_account']}</td><td>{t['receiver_account']}</td><td>{t['currency']} {t['amount']:,.2f}</td></tr>" for t in detail["transactions"]); notes="".join(f"<li>{x['status']}: {x['note'] or '—'} ({x['created_at']})</li>" for x in detail["decisions"])
@@ -235,7 +399,7 @@ def get_settings(user:User=Depends(current_user),db:Session=Depends(get_db)):
     s=latest_settings(db,user); return {"id":s.id,"version":s.version,"config":s.config,"created_at":s.created_at}
 @app.post("/api/settings")
 def save_settings(body:SettingsBody,user:User=Depends(supervisor),db:Session=Depends(get_db)):
-    old=latest_settings(db,user); merged={**DEFAULTS,**body.config}; row=DetectionSettings(workspace_id=user.workspace_id,version=old.version+1,config=merged,created_by=user.id); db.add(row); db.flush(); audit(db,user,"settings.create","detection_settings",row.id,{"version":row.version}); db.commit(); return {"id":row.id,"version":row.version,"config":row.config}
+    old=latest_settings(db,user); merged=validated_detection_config(body.config); row=DetectionSettings(workspace_id=user.workspace_id,version=old.version+1,config=merged,created_by=user.id); db.add(row); db.flush(); audit(db,user,"settings.create","detection_settings",row.id,{"version":row.version}); db.commit(); return {"id":row.id,"version":row.version,"config":row.config}
 @app.get("/api/audit")
 def audit_history(page:int=1,user:User=Depends(current_user),db:Session=Depends(get_db)):
     rows=db.scalars(select(AuditEvent).where(AuditEvent.workspace_id==user.workspace_id).order_by(AuditEvent.created_at.desc()).offset((page-1)*50).limit(50)).all(); return [{"id":x.id,"action":x.action,"target_type":x.target_type,"target_id":x.target_id,"details":x.details,"user_id":x.user_id,"created_at":x.created_at} for x in rows]
@@ -322,10 +486,11 @@ def blockchain_summary(dataset_id:int,user:User=Depends(current_user),db:Session
     return {"dataset":{"id":d.id,"name":d.name,"wallet_count":d.wallet_count,"transaction_node_count":d.transaction_node_count,"relationship_count":d.relationship_count,"source_url":d.source_url,"schema_version":d.schema_version,"subset_method":d.subset_method,"source_files":d.source_files,"imported_at":d.imported_at},"capabilities":d.capabilities,"scores":{"flagged":sum(s.score>=40 for s in scores),"high":sum(s.severity=="High" for s in scores),"reviewed":sum(s.review_status not in ("unreviewed","under_review") for s in scores)},"reference_labels":labels,"notice":"Historical Bitcoin data — Elliptic++. Counts and findings describe the imported bounded subset, not the complete dataset."}
 
 @app.get("/api/blockchain-datasets/{dataset_id}/wallets")
-def blockchain_wallets(dataset_id:int,q:str="",page:int=1,page_size:int=50,user:User=Depends(current_user),db:Session=Depends(get_db)):
+def blockchain_wallets(dataset_id:int,q:str="",severity:str|None=None,page:int=1,page_size:int=50,user:User=Depends(current_user),db:Session=Depends(get_db)):
     d=scoped_blockchain_dataset(db,dataset_id,user); page_size=min(max(page_size,1),100)
     stmt=select(BlockchainWalletScore).where(BlockchainWalletScore.dataset_id==d.id)
     if q: stmt=stmt.where(BlockchainWalletScore.address.contains(q))
+    if severity: stmt=stmt.where(BlockchainWalletScore.severity==severity)
     total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows=db.scalars(stmt.order_by(BlockchainWalletScore.score.desc(),BlockchainWalletScore.address).offset((max(page,1)-1)*page_size).limit(page_size)).all()
     return {"items":[{"id":x.id,"address":x.address,"score":x.score,"severity":x.severity,"review_status":x.review_status,"reasons":x.reasons} for x in rows],"total":total,"page":max(page,1)}
@@ -399,7 +564,10 @@ def blockchain_report(dataset_id:int,address:str,user:User=Depends(current_user)
 def recover_jobs():
     Base.metadata.create_all(engine); db=SessionLocal()
     try:
-        for r in db.scalars(select(AnalysisRun).where(AnalysisRun.status.in_(["queued","running"]))).all(): r.status="failed"; r.error="Interrupted by restart; safe retry is available."
+        # Multiple serverless instances can start concurrently. One cold start
+        # must not mark another live invocation's analysis as interrupted.
+        if not os.getenv("VERCEL"):
+            for r in db.scalars(select(AnalysisRun).where(AnalysisRun.status.in_(["queued","running"]))).all(): r.status="failed"; r.error="Interrupted by restart; safe retry is available."
         db.commit()
     finally: db.close()
 

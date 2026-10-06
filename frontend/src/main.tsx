@@ -37,20 +37,33 @@ import {
   FlaskConical,
   Grid2X2,
   LogOut,
+  Mic,
+  MicOff,
   Network,
   Play,
+  Plus,
   Search,
+  Send,
   Settings,
   ShieldCheck,
+  Square,
+  Trash2,
   Upload,
   Users,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import "./styles.css";
 
 const LoginNetwork3D = React.lazy(() => import("./LoginNetwork3D"));
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// Production is deployed as one Vercel origin, so API calls stay same-origin and
+// authentication cookies never need to cross sites. Local Vite development still
+// talks to the FastAPI dev server unless an explicit URL is provided.
+const API =
+  import.meta.env.VITE_API_URL ??
+  (import.meta.env.DEV ? "http://localhost:8000" : "");
 type User = { id: number; name: string; email: string; role: string };
 type Dataset = {
   id: number;
@@ -307,6 +320,115 @@ function App() {
   return <AuthScreen key={path} mode={path === "/signup" ? "signup" : "login"} navigate={navigate} onAuthenticated={(nextUser) => { setUser(nextUser); navigate("/app"); }} />;
 }
 
+type AssistantContext = {
+  domain: "bank" | "elliptic";
+  dataset_id?: number;
+  run_id?: number;
+  wallet_id?: string;
+};
+type AssistantAction = {
+  type: string;
+  wallet_id?: string;
+  severity?: string;
+  status?: string;
+  transaction_ids?: string[];
+  relationship_ids?: number[];
+};
+type AssistantEvidence = { kind: string; id: string; label: string; wallet_id?: string };
+type AssistantMessage = {
+  id: string;
+  role: "analyst" | "assistant";
+  text: string;
+  evidence?: AssistantEvidence[];
+  choices?: { id: string; label: string; score: number; severity: string }[];
+};
+
+function VoiceAssistant({ context, resetKey, onAction, autoOpen = false, autoSpeak = false, welcomeText }: { context: AssistantContext; resetKey: string; onAction: (action: AssistantAction) => void | Promise<void>; autoOpen?: boolean; autoSpeak?: boolean; welcomeText?: string }) {
+  const [open, setOpen] = React.useState(autoOpen), [input, setInput] = React.useState(""), [messages, setMessages] = React.useState<AssistantMessage[]>([]), [state, setState] = React.useState<"idle" | "listening" | "transcribing" | "processing" | "speaking" | "error">("idle"), [error, setError] = React.useState(""), [muted, setMuted] = React.useState(false), [speechStatus, setSpeechStatus] = React.useState<any>();
+  const recorder = React.useRef<MediaRecorder | null>(null), stream = React.useRef<MediaStream | null>(null), chunks = React.useRef<Blob[]>([]), timeout = React.useRef<number | undefined>(undefined), pending = React.useRef<AbortController | undefined>(undefined), requestVersion = React.useRef(0), contextRef = React.useRef(context), audio = React.useRef<HTMLAudioElement | null>(null), audioUrl = React.useRef<string | null>(null), welcomed = React.useRef(false);
+  contextRef.current = context;
+  const stopTracks = React.useCallback(() => { stream.current?.getTracks().forEach(track => track.stop()); stream.current = null; }, []);
+  const stopPlayback = React.useCallback(() => { audio.current?.pause(); audio.current = null; if (audioUrl.current) URL.revokeObjectURL(audioUrl.current); audioUrl.current = null; window.speechSynthesis?.cancel(); }, []);
+  React.useEffect(() => { requestVersion.current += 1; pending.current?.abort(); }, [context.domain, context.dataset_id, context.run_id, context.wallet_id]);
+  React.useEffect(() => { setMessages([]); setInput(""); setError(""); pending.current?.abort(); stopPlayback(); }, [resetKey]);
+  React.useEffect(() => { api("/api/assistant/status").then(setSpeechStatus).catch(() => setSpeechStatus({ speech_available: false, voice_available: false, max_recording_seconds: 60 })); return () => { pending.current?.abort(); recorder.current?.state === "recording" && recorder.current.stop(); stopTracks(); stopPlayback(); }; }, [stopTracks, stopPlayback]);
+  const cancel = React.useCallback(() => { requestVersion.current += 1; pending.current?.abort(); if (timeout.current) window.clearTimeout(timeout.current); if (recorder.current?.state === "recording") recorder.current.stop(); stopTracks(); stopPlayback(); setState("idle"); }, [stopTracks, stopPlayback]);
+  async function transcribe(blob: Blob) {
+    if (!speechStatus?.speech_available) { setState("error"); setError("Live speech transcription is not configured. Type the command instead; no transcript was simulated."); return; }
+    if (blob.size > (speechStatus.max_audio_bytes || 8 * 1024 * 1024)) { setState("error"); setError("Recording exceeded the configured upload limit."); return; }
+    setState("transcribing"); setError("");
+    const form = new FormData(); form.append("file", blob, "investigation.webm");
+    try { const result = await api("/api/assistant/transcribe", { method: "POST", body: form }); setInput(result.text); setState("idle"); }
+    catch (e) { setState("error"); setError((e as Error).message); }
+  }
+  async function startRecording() {
+    setError("");
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") { setState("error"); setError("This browser does not support secure microphone recording. Use the typed command input."); return; }
+    if (!speechStatus?.speech_available) { setState("error"); setError("Speech transcription is not configured on the server. Typed commands are fully available."); return; }
+    try {
+      stream.current = await navigator.mediaDevices.getUserMedia({ audio: true }); chunks.current = [];
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+      const next = new MediaRecorder(stream.current, { mimeType: mime }); recorder.current = next;
+      next.ondataavailable = event => { if (event.data.size) chunks.current.push(event.data); };
+      next.onstop = () => { if (timeout.current) window.clearTimeout(timeout.current); const blob = new Blob(chunks.current, { type: mime }); stopTracks(); if (blob.size) void transcribe(blob); else { setState("error"); setError("No audio was captured."); } };
+      next.onerror = () => { stopTracks(); setState("error"); setError("Recording failed. Check microphone access and try again."); };
+      next.start(500); setState("listening");
+      timeout.current = window.setTimeout(() => next.state === "recording" && next.stop(), (speechStatus.max_recording_seconds || 60) * 1000);
+    } catch (e) { stopTracks(); setState("error"); setError((e as DOMException).name === "NotAllowedError" ? "Microphone permission was denied. Enable it for this site or use typed commands." : "The microphone could not be started."); }
+  }
+  async function speak(text: string) {
+    if (muted) return;
+    stopPlayback();
+    if (speechStatus?.voice_available) {
+      try {
+        setState("speaking");
+        const response = await fetch(`${API}/api/assistant/speak`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() }, body: JSON.stringify({ text }) });
+        if (!response.ok) throw new Error("ElevenLabs voice generation failed");
+        const url = URL.createObjectURL(await response.blob()); audioUrl.current = url;
+        const next = new Audio(url); audio.current = next;
+        next.onended = () => { stopPlayback(); setState("idle"); };
+        next.onerror = () => { stopPlayback(); setState("idle"); };
+        await next.play(); return;
+      } catch { stopPlayback(); }
+    }
+    if (speechStatus?.speech_provider === "elevenlabs") { setState("idle"); return; }
+    if (!window.speechSynthesis) { setState("idle"); return; }
+    const utterance = new SpeechSynthesisUtterance(text); utterance.rate = 1.02;
+    utterance.onstart = () => setState("speaking"); utterance.onend = () => setState("idle"); utterance.onerror = () => setState("idle"); window.speechSynthesis.speak(utterance);
+  }
+  React.useEffect(() => { if (autoSpeak && welcomeText && speechStatus !== undefined && !welcomed.current) { welcomed.current = true; if (autoOpen) setOpen(true); void speak(welcomeText); } }, [autoOpen, autoSpeak, welcomeText, speechStatus]);
+  async function submit(command = input) {
+    const text = command.trim(); if (!text || !context.dataset_id) return;
+    const version = ++requestVersion.current; pending.current?.abort(); const controller = new AbortController(); pending.current = controller;
+    const messageId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    setMessages(old => [...old, { id: `${messageId}-user`, role: "analyst", text }]); setInput(""); setState("processing"); setError("");
+    try {
+      const result = await api("/api/assistant/command", { method: "POST", signal: controller.signal, body: JSON.stringify({ request_id: messageId, text, context: contextRef.current }) });
+      if (version !== requestVersion.current || controller.signal.aborted) return;
+      await onAction(result.action || { type: "none" });
+      if (version !== requestVersion.current) return;
+      setMessages(old => [...old, { id: `${messageId}-assistant`, role: "assistant", text: result.answer, evidence: result.evidence, choices: result.choices }]); setState("idle"); speak(result.spoken_answer || result.answer);
+    } catch (e) { if ((e as Error).name !== "AbortError" && version === requestVersion.current) { setState("error"); setError((e as Error).message); } }
+  }
+  function choose(id: string) { void onAction({ type: "select_wallet", wallet_id: id }); setMessages(old => [...old, { id: `${Date.now()}-choice`, role: "assistant", text: `Selected ${id}. You can now ask why it was flagged or expand its network.`, evidence: [{ kind: "wallet", id, label: id }] }]); }
+  function closePanel() { cancel(); setOpen(false); }
+  return <div className={`voice-assistant ${open ? "open" : ""}`}>
+    {!open ? <button className="assistant-launch" onClick={() => setOpen(true)} aria-label="Open voice investigation assistant"><Mic/><span>Voice assistant</span></button> : <section className="assistant-panel" aria-label="Voice investigation assistant">
+      <header><div><span className="assistant-orb"><Mic/></span><p><b>MADs Investigation Copilot</b><small>{state === "idle" ? "Evidence-grounded commands" : state}</small></p></div><div><button onClick={() => setMuted(x => !x)} aria-label={muted ? "Unmute spoken responses" : "Mute spoken responses"}>{muted ? <VolumeX/> : <Volume2/>}</button><button onClick={closePanel} aria-label="Close assistant"><X/></button></div></header>
+      <div className="assistant-privacy"><ShieldCheck/><span>{speechStatus?.voice_available ? "Narration and push-to-talk use ElevenLabs; MADs does not retain raw audio." : speechStatus?.speech_available ? `Audio is processed by ${speechStatus.speech_provider} and not retained by MADs.` : "ElevenLabs is awaiting a server key; secure browser narration and typed commands remain available."}</span></div>
+      <div className="assistant-history" aria-live="polite">{messages.length ? messages.map(message => <article key={message.id} className={message.role}><span>{message.role === "assistant" ? "MADs" : "You"}</span><p>{message.text}</p>{message.choices?.length ? <div className="assistant-choices">{message.choices.map(choice => <button key={choice.id} onClick={() => choose(choice.id)}><b>{choice.label}</b><small>{choice.severity} · {choice.score}/100</small></button>)}</div> : null}{message.evidence?.length ? <div className="assistant-evidence">{message.evidence.map(ref => <button key={`${ref.kind}-${ref.id}`} onClick={() => void onAction({ type: "show_evidence", wallet_id: ref.wallet_id || (ref.kind === "wallet" || ref.kind === "account" ? ref.id : context.wallet_id) })}>{ref.kind}: {ref.label}</button>)}</div> : null}</article>) : <div className="assistant-empty"><Mic/><b>Investigate by voice or text</b><p>Try “Show high-risk wallets,” “Why was this wallet flagged?” or “Summarize this investigation.”</p></div>}</div>
+      {error && <div className="assistant-error"><AlertTriangle/>{error}</div>}
+      <label className="assistant-transcript"><span>Editable transcript / command</span><textarea value={input} onChange={e => setInput(e.target.value)} placeholder="Type a command or press the microphone…" onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void submit(); } }}/></label>
+      <footer><button className={`mic-button ${state === "listening" ? "recording" : ""}`} disabled={state === "transcribing" || state === "processing"} onClick={() => state === "listening" ? recorder.current?.stop() : void startRecording()} aria-label={state === "listening" ? "Stop recording" : "Start push-to-talk recording"}>{state === "listening" ? <Square/> : speechStatus?.speech_available ? <Mic/> : <MicOff/>}</button><button className="assistant-send" disabled={!input.trim() || state === "processing"} onClick={() => void submit()}><Send/>Submit</button><button onClick={cancel} disabled={state === "idle" || state === "error"}>Stop</button><button onClick={() => setMessages([])} aria-label="Clear conversation"><Trash2/></button></footer>
+    </section>}
+  </div>;
+}
+
+function DecisionConfirmation({ wallet, status, onCancel, onConfirm }: { wallet: string; status: string; onCancel: () => void; onConfirm: (note: string) => Promise<void> }) {
+  const [note, setNote] = React.useState(""), [busy, setBusy] = React.useState(false), [error, setError] = React.useState("");
+  return <div className="decision-modal" role="dialog" aria-modal="true" aria-labelledby="decision-title"><form onSubmit={async e => { e.preventDefault(); if (note.trim().length < 10) return; setBusy(true); setError(""); try { await onConfirm(note.trim()); } catch (err) { setError((err as Error).message); setBusy(false); } }}><span className="eyebrow">REQUIRES ON-SCREEN CONFIRMATION</span><h2 id="decision-title">{status.replaceAll("_", " ")}</h2><p>Wallet/account: <b>{wallet}</b></p><label>Required analyst rationale<textarea autoFocus minLength={10} required value={note} onChange={e => setNote(e.target.value)} placeholder="Document the evidence and rationale (minimum 10 characters)…"/></label>{error && <div className="error">{error}</div>}<div><button type="button" onClick={onCancel}>Cancel</button><button className="primary" disabled={busy || note.trim().length < 10}>{busy ? "Saving…" : "Confirm decision"}</button></div><small>A spoken “yes” cannot submit this decision. Saving uses the authorized endpoint and audit trail.</small></form></div>;
+}
+
 function Console({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [view, setView] = React.useState("dashboard"),
     [datasets, setDatasets] = React.useState<Dataset[]>([]),
@@ -344,7 +466,7 @@ function Console({ user, onLogout }: { user: User; onLogout: () => void }) {
     ["audit", Clock3, "Reports"],
     ...(user.role === "supervisor" ? [["settings", Settings, "Settings"]] : []),
   ] as any[];
-  const currentLabel = nav.find(([id]) => id === view)?.[2] || "Overview";
+  const currentLabel = nav.find(([id]) => id === view)?.[2] || (view === "transactions" ? "Imported transactions" : "Overview");
   const initials = user.name.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
   return (
     <div className="shell">
@@ -377,7 +499,7 @@ function Console({ user, onLogout }: { user: User; onLogout: () => void }) {
               <span className="environment-pill"><i /> Historical Bitcoin subset</span>
             ) : (
               <>
-                <select aria-label="Active dataset" value={datasetId || ""} onChange={(e) => { setDatasetId(Number(e.target.value)); setRunId(undefined); }}>
+                <select aria-label="Active dataset" value={datasetId || ""} onChange={(e) => { const next=Number(e.target.value)||undefined;setSummary(undefined);setDatasetId(next);setRunId(undefined); }}>
                   <option value="">No dataset selected</option>
                   {datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
                 </select>
@@ -393,9 +515,10 @@ function Console({ user, onLogout }: { user: User; onLogout: () => void }) {
           <AnimatePresence mode="wait">
             <motion.div key={view} className="view-stage" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: 0.18 }}>
               {view === "dashboard" && <Dashboard summary={summary} datasetId={datasetId} runId={runId} setRunId={setRunId} setView={setView} flash={setNotice} blockchainDataset={blockchainDatasets[0]} />}
-              {view === "upload" && <UploadView onDone={async (id) => { await load(); setDatasetId(id); setView("dashboard"); setNotice("Dataset imported successfully."); }} onBlockchainDone={() => { setView("elliptic"); setNotice("Official Elliptic++ subset imported successfully."); }} />}
+              {view === "upload" && <UploadView onDone={async (id, automaticRunId) => { setSummary(undefined);setDatasetId(id);if(automaticRunId)setRunId(automaticRunId);await load();const uploadedSummary=await api(`/api/datasets/${id}/summary`);setSummary(uploadedSummary);if(uploadedSummary.run_id)setRunId(uploadedSummary.run_id);setView("dashboard");setNotice(`CSV imported: ${uploadedSummary.dataset.transaction_count.toLocaleString()} rows analyzed and all overview graphs refreshed.`); }} onBlockchainDone={() => { setView("elliptic"); setNotice("Official Elliptic++ subset imported successfully."); }} />}
               {view === "elliptic" && <EllipticView />}
               {view === "accounts" && <Accounts runId={runId} onInspect={() => setView("network")} />}
+              {view === "transactions" && <TransactionsView datasetId={datasetId} runId={runId} onBack={() => setView("dashboard")} />}
               {view === "network" && <NetworkView datasetId={datasetId} runId={runId} />}
               {view === "honeypot" && <HoneypotView summary={summary} runId={runId} onInspect={() => setView("network")} />}
               {view === "audit" && <Audit />}
@@ -403,6 +526,15 @@ function Console({ user, onLogout }: { user: User; onLogout: () => void }) {
             </motion.div>
           </AnimatePresence>
         </main>
+        <div style={{ display: view === "dashboard" ? "contents" : "none" }}>
+          <VoiceAssistant
+            context={{ domain: "bank", dataset_id: datasetId, run_id: runId }}
+            resetKey={`welcome-${user.id}`}
+            autoSpeak
+            welcomeText={`Hi ${user.name}. Welcome to MADs. I’m your investigation copilot. I can find high-risk accounts, explain why they were flagged, trace transaction networks, and summarize the evidence. Elliptic++ is historical Bitcoin data, while Network Explorer follows directed money flows. Remember, a risk score guides review; it is not proof of fraud. When you’re ready, select a dataset and ask me what you want to investigate.`}
+            onAction={(action) => { if (action.type === "filter_high_risk") setView("accounts"); else if (["select_wallet", "show_evidence", "expand_network"].includes(action.type)) setView("network"); }}
+          />
+        </div>
       </div>
     </div>
   );
@@ -441,11 +573,16 @@ function Dashboard({
     }
   }
   const cards = [
-    ["Transactions analyzed", summary?.dataset.transaction_count || 0, Database, "Imported records in the active dataset"],
-    ["Flagged accounts", summary?.flagged_accounts || 0, AlertTriangle, "Accounts with at least one explainable signal"],
-    ["High-risk accounts", summary?.high_risk || 0, ShieldCheck, "Highest-priority accounts for analyst review"],
-    ["Open investigations", summary?.awaiting_review || 0, FileSearch, "Accounts awaiting a final analyst decision"],
+    ["Transactions analyzed", summary?.dataset.transaction_count || 0, Database, "Imported records in the active CSV", "transactions"],
+    ["Flagged accounts", summary?.flagged_accounts || 0, AlertTriangle, "Click to inspect every explanation", "flagged"],
+    ["High-risk accounts", summary?.high_risk || 0, ShieldCheck, "Strict threshold matches requiring priority review", "high"],
+    ["Open investigations", summary?.awaiting_review || 0, FileSearch, "Accounts awaiting a final analyst decision", "open"],
   ] as any[];
+  function openMetric(target:string) {
+    if (target === "transactions") { setView("transactions"); return; }
+    sessionStorage.setItem("severityFilter", target === "high" ? "High" : "");
+    setView("accounts");
+  }
   const riskData = [
     { name: "High risk", value: summary?.high_risk || 0, color: "#f45f72" },
     {
@@ -495,7 +632,7 @@ function Dashboard({
       {blockchainDataset&&<button className="dashboard-blockchain" onClick={()=>setView("elliptic")}><span><Network/><i/></span><div><small>HISTORICAL BITCOIN DATA — ELLIPTIC++</small><b>{blockchainDataset.name}</b><p>{blockchainDataset.transaction_node_count.toLocaleString()} transaction nodes · {blockchainDataset.wallet_count.toLocaleString()} wallet addresses · bounded real-data subset</p></div><ChevronRight/></button>}
       <section className="monitoring-banner">
         <Activity />
-        <div><b>{summary?.dataset?.name ? `${summary.dataset.name} is active` : "Connect a transaction dataset"}</b><span>{summary?.dataset?.name?.toLowerCase().includes("ibm") ? "15,000 internet-sourced IBM AML benchmark CSV rows · network-rich research data." : "Every graph edge and finding is derived from the selected imported CSV."}</span></div>
+        <div><b>{summary?.dataset?.name ? `${summary.dataset.name} is active` : datasetId ? "Loading imported dataset…" : "Connect a transaction dataset"}</b><span>{summary?.dataset ? `${summary.dataset.transaction_count.toLocaleString()} accepted rows from ${summary.dataset.filename} · every metric, graph, and finding below is derived from this imported CSV.` : "Upload a validated CSV to calculate overview metrics and graphs."}</span></div>
         <button onClick={() => setView("upload")}>Upload dataset</button>
       </section>
       {job && job.status !== "completed" && (
@@ -509,15 +646,16 @@ function Dashboard({
         </div>
       )}
       <section className="metrics">
-        {cards.map(([label, value, Icon, description], index) => (
-          <article key={label} className="tilt-card" style={{"--delay": `${index * -0.45}s`} as React.CSSProperties}>
+        {cards.map(([label, value, Icon, description, target], index) => (
+          <button type="button" key={label} className="tilt-card metric-action" onClick={()=>openMetric(target)} style={{"--delay": `${index * -0.45}s`} as React.CSSProperties}>
             <div className="metric-icon">
               <span className="icon-depth"><Icon /></span>
             </div>
             <span>{label}</span>
             <strong>{value.toLocaleString()}</strong>
             <small>{description}</small>
-          </article>
+            <em>Open details <ChevronRight/></em>
+          </button>
         ))}
       </section>
       <section className="chart-grid grid gap-4 xl:grid-cols-2">
@@ -564,6 +702,13 @@ function Dashboard({
           ) : (
             <Empty text="Run an analysis to chart account risk." />
           )}
+        </article>
+        <article className="panel depth-panel chart-panel">
+          <div className="panel-head">
+            <div><h2>Detected pattern distribution</h2><p>Explainable findings produced from the imported CSV</p></div>
+            <Network />
+          </div>
+          {summary?.patterns?.length ? <div className="chart-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={summary.patterns} margin={{left:0,right:12,top:16,bottom:18}}><CartesianGrid stroke="#e4e1d9" vertical={false} strokeDasharray="4 6"/><XAxis dataKey="name" tick={{fill:"#8e8b99",fontSize:10}} axisLine={false} tickLine={false}/><YAxis tick={{fill:"#8e8b99",fontSize:11}} axisLine={false} tickLine={false} allowDecimals={false}/><Tooltip contentStyle={{background:"#fffefa",border:"1px solid #e4e1d8",borderRadius:10,color:"#11162d"}}/><Bar dataKey="value" name="Findings" fill="#a86ceb" radius={[8,8,0,0]}/></BarChart></ResponsiveContainer></div>:<Empty text="No detector pattern crossed the configured threshold."/>}
         </article>
       </section>
       <section className="split">
@@ -621,7 +766,7 @@ function Dashboard({
   );
 }
 
-function UploadView({ onDone, onBlockchainDone }: { onDone: (id: number) => void; onBlockchainDone: () => void }) {
+function UploadView({ onDone, onBlockchainDone }: { onDone: (id: number, runId?: number) => void; onBlockchainDone: () => void }) {
   const [mode,setMode]=React.useState<"bank"|"elliptic">("bank");
   return <>
     <div className="import-mode" role="tablist" aria-label="Dataset import type">
@@ -632,15 +777,18 @@ function UploadView({ onDone, onBlockchainDone }: { onDone: (id: number) => void
   </>;
 }
 
-function BankUploadView({ onDone }: { onDone: (id: number) => void }) {
+function BankUploadView({ onDone }: { onDone: (id: number, runId?: number) => void }) {
   const [name, setName] = React.useState(""),
     [tx, setTx] = React.useState<File>(),
     [acct, setAcct] = React.useState<File>(),
     [preview, setPreview] = React.useState<any>(),
+    [validating, setValidating] = React.useState(false),
     [busy, setBusy] = React.useState(false),
     [error, setError] = React.useState("");
   async function check(f: File) {
     setTx(f);
+    setPreview(undefined);
+    setValidating(true);
     setError("");
     const form = new FormData();
     form.append("file", f);
@@ -650,6 +798,8 @@ function BankUploadView({ onDone }: { onDone: (id: number) => void }) {
       );
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setValidating(false);
     }
   }
   async function submit() {
@@ -662,7 +812,15 @@ function BankUploadView({ onDone }: { onDone: (id: number) => void }) {
     if (acct) form.append("accounts", acct);
     try {
       const d = await api("/api/datasets", { method: "POST", body: form });
-      onDone(d.id);
+      if (d.run_id) {
+        let state:any={status:"queued"};
+        for (let attempt=0;attempt<300&&!['completed','failed'].includes(state.status);attempt++) {
+          if (attempt) await new Promise(resolve=>window.setTimeout(resolve,500));
+          state=await api(`/api/analyses/${d.run_id}`);
+        }
+        if (state.status!=="completed") throw new Error(state.error||"Automatic analysis did not complete in time");
+      }
+      onDone(d.id,d.run_id);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -730,10 +888,10 @@ function BankUploadView({ onDone }: { onDone: (id: number) => void }) {
           )}
           <button
             className="primary wide"
-            disabled={!preview?.valid || busy}
+            disabled={!preview?.valid || busy || validating}
             onClick={submit}
           >
-            {busy ? "Importing…" : "Import validated dataset"}
+            {validating ? "Validating selected CSV…" : busy ? "Importing and analyzing every row…" : "Import and analyze validated CSV"}
           </button>
         </article>
         <aside className="panel safety-checklist">
@@ -823,13 +981,20 @@ function EllipticUpload({onDone}:{onDone:()=>void}){
 }
 
 function EllipticView(){
-  const [datasets,setDatasets]=React.useState<any[]>([]),[datasetId,setDatasetId]=React.useState<number>(),[summary,setSummary]=React.useState<any>(),[wallets,setWallets]=React.useState<any[]>([]),[wallet,setWallet]=React.useState(""),[query,setQuery]=React.useState(""),[detail,setDetail]=React.useState<any>(),[evaluation,setEvaluation]=React.useState<any>(),[hops,setHops]=React.useState(1),[nodes,setNodes]=React.useState<Node[]>([]),[edges,setEdges]=React.useState<Edge[]>([]),[graphTruncated,setGraphTruncated]=React.useState(false),[error,setError]=React.useState("");
+  const [datasets,setDatasets]=React.useState<any[]>([]),[datasetId,setDatasetId]=React.useState<number>(),[summary,setSummary]=React.useState<any>(),[wallets,setWallets]=React.useState<any[]>([]),[wallet,setWallet]=React.useState(""),[query,setQuery]=React.useState(""),[detail,setDetail]=React.useState<any>(),[evaluation,setEvaluation]=React.useState<any>(),[hops,setHops]=React.useState(1),[nodes,setNodes]=React.useState<Node[]>([]),[edges,setEdges]=React.useState<Edge[]>([]),[graphTruncated,setGraphTruncated]=React.useState(false),[error,setError]=React.useState(""),[decisionDraft,setDecisionDraft]=React.useState<{status:string}|null>(null);
   React.useEffect(()=>{api("/api/blockchain-datasets").then((d:any[])=>{setDatasets(d);if(d[0])setDatasetId(d[0].id)}).catch(e=>setError(e.message));},[]);
   React.useEffect(()=>{if(!datasetId)return;Promise.all([api(`/api/blockchain-datasets/${datasetId}/summary`),api(`/api/blockchain-datasets/${datasetId}/wallets?page_size=30`),api(`/api/blockchain-datasets/${datasetId}/evaluation`)]).then(([s,w,e])=>{setSummary(s);setWallets(w.items);setEvaluation(e);if(w.items[0])setWallet(w.items[0].address)}).catch(e=>setError(e.message));},[datasetId]);
   const loadWallet=React.useCallback(async(address=wallet)=>{if(!datasetId||!address)return;try{const [d,n]=await Promise.all([api(`/api/blockchain-datasets/${datasetId}/wallets/${encodeURIComponent(address)}`),api(`/api/blockchain-datasets/${datasetId}/network?wallet=${encodeURIComponent(address)}&hops=${hops}&node_limit=45&edge_limit=90`)]);setDetail(d);setGraphTruncated(Boolean(n.truncated));const center={x:360,y:230};const others=n.nodes.filter((x:any)=>!(x.node_type==="wallet"&&x.id===address));setNodes(n.nodes.map((x:any)=>{const key=`${x.node_type}:${x.id}`,i=others.indexOf(x),angle=i/Math.max(others.length,1)*Math.PI*2-Math.PI/2,r=x.node_type==="transaction"?150:235;return{id:key,position:x.node_type==="wallet"&&x.id===address?center:{x:center.x+Math.cos(angle)*r,y:center.y+Math.sin(angle)*r},data:{label:""},ariaLabel:x.node_type==="transaction"?"Bitcoin transaction node":"Wallet node",className:`elliptic-node ${x.node_type} ${x.severity?.toLowerCase()||""} ${x.id===address?"selected":""}`}}));setEdges(n.edges.map((e:any)=>({id:String(e.id),source:`${e.source_type}:${e.source}`,target:`${e.target_type}:${e.target}`,animated:e.relationship_type!=="ADDR_ADDR",markerEnd:{type:MarkerType.ArrowClosed,color:"#8574a8"},style:{stroke:e.relationship_type==="ADDR_ADDR"?"#a8a2b4":"#8574a8",strokeWidth:1.8}})));}catch(e){setError((e as Error).message)}},[datasetId,wallet,hops]);
   React.useEffect(()=>{loadWallet()},[loadWallet]);
   async function search(){if(!datasetId)return;const w=await api(`/api/blockchain-datasets/${datasetId}/wallets?q=${encodeURIComponent(query)}&page_size=30`);setWallets(w.items);if(w.items[0])setWallet(w.items[0].address)}
   async function decide(status:string){if(!datasetId||!wallet)return;const note=(status==="confirmed_suspicious"||status==="cleared")?(prompt("Required analyst note:")||""):"";if((status==="confirmed_suspicious"||status==="cleared")&&!note)return;await api(`/api/blockchain-datasets/${datasetId}/wallets/${encodeURIComponent(wallet)}/decision`,{method:"POST",body:JSON.stringify({status,note})});loadWallet()}
+  async function assistantAction(action:AssistantAction){
+    if(!datasetId)return;
+    if(action.type==="filter_high_risk"){const result=await api(`/api/blockchain-datasets/${datasetId}/wallets?severity=High&page_size=100`);setWallets(result.items);setQuery("");return;}
+    if((action.type==="select_wallet"||action.type==="show_evidence")&&action.wallet_id){setWallet(action.wallet_id);if(action.type==="show_evidence")window.setTimeout(()=>document.getElementById("elliptic-evidence")?.scrollIntoView({behavior:"smooth",block:"center"}),80);return;}
+    if(action.type==="expand_network"){setHops(value=>Math.min(3,value+1));return;}
+    if(action.type==="open_decision_form"&&action.wallet_id&&action.status){setWallet(action.wallet_id);setDecisionDraft({status:action.status});}
+  }
   if(!datasets.length)return <><div className="page-title"><div><span className="eyebrow teal">BLOCKCHAIN INTELLIGENCE</span><h1>Historical Bitcoin data — Elliptic++</h1><p>No official Elliptic++ dataset has been imported into this workspace.</p></div></div>{error&&<div className="error"><AlertTriangle/>{error}</div>}<div className="panel empty-blockchain"><Network/><h2>Import the eight official CSV files</h2><p>Use Data &amp; uploads → Elliptic++ Blockchain Dataset. MADs will never substitute demo records.</p></div></>;
   return <>
     <div className="page-title"><div><span className="eyebrow teal">HISTORICAL BITCOIN DATA / REAL BOUNDED SUBSET</span><h1>Elliptic++ Blockchain Dataset</h1><p>Wallet addresses and transaction nodes are preserved as different entities.</p></div><div className="blockchain-actions"><select value={datasetId} onChange={e=>setDatasetId(Number(e.target.value))}>{datasets.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select>{datasetId&&<a className="secondary" href={`${API}/api/blockchain-datasets/${datasetId}/export`}><Download/>Export</a>}</div></div>
@@ -839,9 +1004,23 @@ function EllipticView(){
     <section className="elliptic-workbench">
       <aside className="panel wallet-list"><div className="wallet-search"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search wallet address" onKeyDown={e=>e.key==="Enter"&&search()}/><button onClick={search}><Search/></button></div>{wallets.map(item=><button key={item.address} className={wallet===item.address?"active":""} onClick={()=>setWallet(item.address)}><span className={`risk-dot ${item.severity.toLowerCase()}`}/><p><b>{item.address}</b><small>Wallet · {statusLabel(item.review_status)}</small></p><strong>{item.score}</strong></button>)}</aside>
       <article className="graph-panel elliptic-graph"><div className="graph-title"><div><h2>Wallet ↔ transaction network</h2><p>Circles are wallets; diamonds are Bitcoin transactions</p></div><select value={hops} onChange={e=>setHops(Number(e.target.value))}><option value="1">1-hop</option><option value="2">2-hop</option><option value="3">3-hop</option></select></div><div className="legend"><span><i className="wallet-key"/>Wallet address</span><span><i className="tx-key"/>Transaction node</span><span>Arrows preserve official direction</span>{graphTruncated&&<span className="graph-limit">Showing a focused 45-node neighborhood</span>}</div><div className="graph"><ReactFlow nodes={nodes} edges={edges} fitView onNodeClick={(_,node)=>{if(node.id.startsWith("wallet:"))setWallet(node.id.slice(7))}}><Background color="#d8d5ce" gap={24} size={1}/><Controls showInteractive={false}/></ReactFlow></div></article>
-      <aside className="evidence blockchain-evidence">{detail?<><span className="eyebrow">SELECTED WALLET ADDRESS</span><h2>{wallet}</h2><div className="risk-score"><strong>{detail.score.score}</strong><span>/100<br/>structural score</span></div><div className="score-bar"><i style={{width:`${detail.score.score}%`}}/></div><dl><div><dt>Severity</dt><dd>{detail.score.severity}</dd></div><div><dt>Analyst judgment</dt><dd>{statusLabel(detail.score.review_status)}</dd></div><div><dt>First ordinal step</dt><dd>{detail.wallet.first_time_step??"—"}</dd></div></dl><div className="reason-box"><b>Structural evidence</b>{detail.score.reasons.length?detail.score.reasons.map((r:string)=><p key={r}>{r}</p>):<p>No structural threshold crossed.</p>}</div><div className="reference-label"><span>DATASET REFERENCE LABEL</span><b>{detail.reference_label?.name||"Unavailable"}</b><p>Not a MADs prediction. Never used as detector input.</p></div><div className="decision-row"><button onClick={()=>decide("confirmed_suspicious")}>Confirm</button><button onClick={()=>decide("cleared")}>Clear</button></div><a className="primary report-link" href={`${API}/api/blockchain-datasets/${datasetId}/report/${encodeURIComponent(wallet)}`} target="_blank" rel="noreferrer">Open evidence report ↗</a></>:<Empty text="Select a wallet to inspect evidence."/>}</aside>
+      <aside id="elliptic-evidence" className="evidence blockchain-evidence">{detail?<><span className="eyebrow">SELECTED WALLET ADDRESS</span><h2>{wallet}</h2><div className="risk-score"><strong>{detail.score.score}</strong><span>/100<br/>structural score</span></div><div className="score-bar"><i style={{width:`${detail.score.score}%`}}/></div><dl><div><dt>Severity</dt><dd>{detail.score.severity}</dd></div><div><dt>Analyst judgment</dt><dd>{statusLabel(detail.score.review_status)}</dd></div><div><dt>First ordinal step</dt><dd>{detail.wallet.first_time_step??"—"}</dd></div></dl><div className="reason-box"><b>Structural evidence</b>{detail.score.reasons.length?detail.score.reasons.map((r:string)=><p key={r}>{r}</p>):<p>No structural threshold crossed.</p>}</div><div className="reference-label"><span>DATASET REFERENCE LABEL</span><b>{detail.reference_label?.name||"Unavailable"}</b><p>Not a MADs prediction. Never used as detector input.</p></div><div className="decision-row"><button onClick={()=>decide("confirmed_suspicious")}>Confirm</button><button onClick={()=>decide("cleared")}>Clear</button></div><a className="primary report-link" href={`${API}/api/blockchain-datasets/${datasetId}/report/${encodeURIComponent(wallet)}`} target="_blank" rel="noreferrer">Open evidence report ↗</a></>:<Empty text="Select a wallet to inspect evidence."/>}</aside>
     </section>
     <section className="panel evaluation-card"><div><span className="eyebrow">REFERENCE-LABEL EVALUATION</span><h2>Graph-only detector evaluation</h2><p>{evaluation?.scope}</p><small>{evaluation?.methodology}</small></div><div className="metric"><span>Precision</span><b>{evaluation?.precision==null?"N/A":`${(evaluation.precision*100).toFixed(1)}%`}</b></div><div className="metric"><span>Recall</span><b>{evaluation?.recall==null?"N/A":`${(evaluation.recall*100).toFixed(1)}%`}</b></div><div className="metric"><span>Known-label sample</span><b>{evaluation?.known_label_sample_count??0}</b><small>{evaluation?.unknown_labels_excluded??0} unknown excluded</small></div></section>
+    {datasetId&&<VoiceAssistant context={{domain:"elliptic",dataset_id:datasetId,wallet_id:wallet}} resetKey={`elliptic-${datasetId}`} onAction={assistantAction}/>}
+    {decisionDraft&&<DecisionConfirmation wallet={wallet} status={decisionDraft.status} onCancel={()=>setDecisionDraft(null)} onConfirm={async note=>{await api(`/api/blockchain-datasets/${datasetId}/wallets/${encodeURIComponent(wallet)}/decision`,{method:"POST",body:JSON.stringify({status:decisionDraft.status,note})});setDecisionDraft(null);await loadWallet();}}/>}
+  </>;
+}
+
+function TransactionsView({ datasetId, runId, onBack }: { datasetId?: number; runId?: number; onBack: () => void }) {
+  const [data,setData]=React.useState<any>({items:[],total:0,page:1,page_size:50}),[q,setQ]=React.useState(""),[page,setPage]=React.useState(1),[error,setError]=React.useState("");
+  React.useEffect(()=>{if(!datasetId)return;api(`/api/datasets/${datasetId}/transactions?page=${page}&page_size=50&q=${encodeURIComponent(q)}`).then(setData).catch(e=>setError(e.message));},[datasetId,page,q]);
+  return <>
+    <div className="page-title"><div><span className="eyebrow teal">VERIFIED CSV RECORDS</span><h1>Imported transactions</h1><p>{data.total.toLocaleString()} accepted records from {data.source_filename||"the active CSV"}. No generated transactions are shown.</p></div><div className="actions"><button className="secondary" onClick={onBack}>Back to overview</button>{runId&&<><a className="secondary" href={`${API}/api/analyses/${runId}/report`} target="_blank" rel="noreferrer"><FileSearch/>Full analysis report</a><a className="secondary" href={`${API}/api/analyses/${runId}/export?format=csv`}><Download/>Export findings CSV</a></>}</div></div>
+    <div className="toolbar"><label><Search/><input value={q} onChange={e=>{setQ(e.target.value);setPage(1)}} placeholder="Search transaction or account ID"/></label></div>
+    {error&&<div className="error"><AlertTriangle/>{error}</div>}
+    <section className="panel table-panel"><div className="table-wrap"><table><thead><tr><th>Transaction ID</th><th>Timestamp</th><th>Sender</th><th>Receiver</th><th>Documented amount</th></tr></thead><tbody>{data.items.map((row:any)=><tr key={row.transaction_id}><td><b>{row.transaction_id}</b></td><td>{new Date(row.timestamp).toLocaleString()}</td><td>{row.sender_account}</td><td>{row.receiver_account}</td><td>{row.currency} {row.amount.toLocaleString(undefined,{maximumFractionDigits:2})}</td></tr>)}</tbody></table></div>{!data.items.length&&<Empty text="No imported transactions match this search."/>}</section>
+    <div className="pagination"><button disabled={page<=1} onClick={()=>setPage(x=>x-1)}>Previous</button><span>Page {page} of {Math.max(1,Math.ceil(data.total/50))}</span><button disabled={page*50>=data.total} onClick={()=>setPage(x=>x+1)}>Next</button></div>
   </>;
 }
 
@@ -854,13 +1033,12 @@ function Accounts({
 }) {
   const [data, setData] = React.useState<Score[]>([]),
     [q, setQ] = React.useState(""),
-    [severity, setSeverity] = React.useState("");
-  React.useEffect(() => {
-    if (runId)
-      api(
-        `/api/analyses/${runId}/scores?q=${encodeURIComponent(q)}&severity=${severity}`,
-      ).then((x: any) => setData(x.items));
-  }, [runId, q, severity]);
+    [severity, setSeverity] = React.useState(sessionStorage.getItem("severityFilter")||""),
+    [page,setPage]=React.useState(1),[total,setTotal]=React.useState(0),[detail,setDetail]=React.useState<any>(),[detailLoading,setDetailLoading]=React.useState(false),[decisionDraft,setDecisionDraft]=React.useState<{status:string}|null>(null),[error,setError]=React.useState("");
+  const load=React.useCallback(async()=>{if(!runId)return;try{const x=await api(`/api/analyses/${runId}/scores?q=${encodeURIComponent(q)}&severity=${severity}&page=${page}&page_size=50`);setData(x.items);setTotal(x.total)}catch(e){setError((e as Error).message)}},[runId,q,severity,page]);
+  React.useEffect(() => { void load(); }, [load]);
+  async function explain(account:string){if(!runId)return;setError("");setDetail(undefined);setDetailLoading(true);try{setDetail(await api(`/api/analyses/${runId}/accounts/${encodeURIComponent(account)}`));}catch(e){setError((e as Error).message)}finally{setDetailLoading(false)}}
+  async function startReview(account:string){if(!runId)return;await api(`/api/analyses/${runId}/accounts/${encodeURIComponent(account)}/decision`,{method:"POST",body:JSON.stringify({status:"under_review",note:"Review opened from prioritized queue"})});await load();if(detail?.score.account_id===account)await explain(account)}
   return (
     <>
       <div className="page-title">
@@ -874,6 +1052,7 @@ function Accounts({
         </div>
         {runId && (
           <div className="actions">
+            <a className="secondary" href={`${API}/api/analyses/${runId}/report`} target="_blank" rel="noreferrer"><FileSearch /> Complete report</a>
             <a
               className="secondary"
               href={`${API}/api/analyses/${runId}/export?format=csv`}
@@ -895,14 +1074,14 @@ function Accounts({
           <input
             placeholder="Search account ID"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => {setQ(e.target.value);setPage(1)}}
           />
         </label>
         <label>
           <Filter />
           <select
             value={severity}
-            onChange={(e) => setSeverity(e.target.value)}
+            onChange={(e) => {setSeverity(e.target.value);setPage(1);sessionStorage.setItem("severityFilter",e.target.value)}}
           >
             <option value="">All severities</option>
             <option>High</option>
@@ -953,16 +1132,7 @@ function Accounts({
                     </td>
                     <td>{statusLabel(s.review_status)}</td>
                     <td>
-                      <button
-                        className="icon-btn"
-                        aria-label={`Inspect ${s.account_id}`}
-                        onClick={() => {
-                          sessionStorage.setItem("account", s.account_id);
-                          onInspect();
-                        }}
-                      >
-                        <ChevronRight />
-                      </button>
+                      <div className="row-actions"><button className="secondary compact-action" onClick={()=>void explain(s.account_id)}><Eye/>Why flagged?</button><button className="icon-btn" aria-label={`Open network for ${s.account_id}`} onClick={() => {sessionStorage.setItem("account", s.account_id);onInspect();}}><Network /></button></div>
                     </td>
                   </tr>
                 ))}
@@ -979,6 +1149,10 @@ function Accounts({
           />
         )}
       </section>
+      <div className="pagination"><button disabled={page<=1} onClick={()=>setPage(x=>x-1)}>Previous</button><span>{total.toLocaleString()} flagged accounts · Page {page} of {Math.max(1,Math.ceil(total/50))}</span><button disabled={page*50>=total} onClick={()=>setPage(x=>x+1)}>Next</button></div>
+      {error&&<div className="error"><AlertTriangle/>{error}</div>}
+      {(detailLoading||detail)&&<div className="evidence-overlay" role="presentation" onMouseDown={e=>{if(e.target===e.currentTarget&&!detailLoading)setDetail(undefined)}}><section className="panel flag-explanation" role="dialog" aria-modal="true" aria-label="Why this account was flagged">{detailLoading?<div className="evidence-loading"><Activity/><b>Loading verified evidence…</b><span>Reading detector findings and supporting CSV transactions.</span></div>:detail&&<><div className="panel-head"><div><span className="eyebrow">WHY THIS ACCOUNT WAS FLAGGED</span><h2>{detail.score.account_id}</h2><p>Automated score {detail.score.score}/100 ({detail.score.severity}) · Analyst status: {statusLabel(detail.score.review_status)}</p></div><button className="icon-btn" onClick={()=>setDetail(undefined)} aria-label="Close explanation"><X/></button></div><div className="explanation-grid"><div><h3>Explainable signals</h3>{detail.findings.map((finding:any)=><article className="reason-box" key={finding.id}><b>{finding.detector.replaceAll("_"," ")} · v{finding.detector_version}</b><p>{finding.reason}</p><small>{finding.limitations.join(" ")}</small><div>{finding.transaction_ids.map((id:string)=><code key={id}>{id}</code>)}</div></article>)}</div><aside><h3>Change analyst status</h3><p>Automated evidence remains unchanged; your judgment and note are stored separately in the audit trail.</p><button onClick={()=>void startReview(detail.score.account_id)}>Start review</button><button onClick={()=>setDecisionDraft({status:"confirmed_suspicious"})}>Confirm suspicious</button><button onClick={()=>setDecisionDraft({status:"cleared"})}>Clear account</button><a className="primary report-link" href={`${API}/api/analyses/${runId}/report/${encodeURIComponent(detail.score.account_id)}`} target="_blank" rel="noreferrer"><Download/>Account evidence report</a></aside></div></>}</section></div>}
+      {decisionDraft&&detail&&<DecisionConfirmation wallet={detail.score.account_id} status={decisionDraft.status} onCancel={()=>setDecisionDraft(null)} onConfirm={async note=>{await api(`/api/analyses/${runId}/accounts/${encodeURIComponent(detail.score.account_id)}/decision`,{method:"POST",body:JSON.stringify({status:decisionDraft.status,note})});setDecisionDraft(null);await load();await explain(detail.score.account_id)}}/>}
     </>
   );
 }
@@ -1000,7 +1174,8 @@ function NetworkView({
     [queue, setQueue] = React.useState<Score[]>([]),
     [nodes, setNodes] = React.useState<Node[]>([]),
     [edges, setEdges] = React.useState<Edge[]>([]),
-    [error, setError] = React.useState("");
+    [error, setError] = React.useState(""),
+    [decisionDraft, setDecisionDraft] = React.useState<{ status: string } | null>(null);
   const loadVersion = React.useRef(0);
   React.useEffect(() => {
     if (runId) api(`/api/analyses/${runId}/scores?page_size=12`).then((result: any) => {
@@ -1093,6 +1268,31 @@ function NetworkView({
     });
     load();
   }
+  async function assistantAction(action: AssistantAction) {
+    if (!runId) return;
+    if (action.type === "filter_high_risk") {
+      const result = await api(`/api/analyses/${runId}/scores?severity=High&page_size=100`);
+      setQueue(result.items || []);
+      return;
+    }
+    if ((action.type === "select_wallet" || action.type === "show_evidence") && action.wallet_id) {
+      setAccount(action.wallet_id); sessionStorage.setItem("account", action.wallet_id);
+      if (action.type === "show_evidence") {
+        const wanted = new Set(action.transaction_ids || []);
+        if (wanted.size) setEdges(current => current.map(edge => {
+          const transactions = (edge.data?.transactions as { id: string }[] | undefined) || [];
+          const highlighted = transactions.some(tx => wanted.has(tx.id));
+          return highlighted ? { ...edge, animated: true, className: "assistant-highlighted-edge", style: { ...edge.style, stroke: "#8e54ca", strokeWidth: 4 } } : edge;
+        }));
+        window.setTimeout(() => document.getElementById("bank-evidence")?.scrollIntoView({ behavior: "smooth", block: "center" }), 80);
+      }
+      return;
+    }
+    if (action.type === "expand_network") { setHops(value => Math.min(2, value + 1)); return; }
+    if (action.type === "open_decision_form" && action.wallet_id && action.status) {
+      setAccount(action.wallet_id); sessionStorage.setItem("account", action.wallet_id); setDecisionDraft({ status: action.status });
+    }
+  }
   return (
     <>
       <div className="page-title compact-title">
@@ -1178,7 +1378,7 @@ function NetworkView({
             </div>
           )}
         </article>
-        <aside className="evidence">
+        <aside id="bank-evidence" className="evidence">
           {detail ? (
             <>
               <div className="account-head">
@@ -1249,29 +1449,38 @@ function NetworkView({
           <div className="timeline-track">{detail.transactions.slice(0, 8).map((tx: any, index: number) => <div key={tx.transaction_id} style={{ "--step": index } as React.CSSProperties}><i /><b>{tx.transaction_id}</b><span>{tx.sender_account} → {tx.receiver_account}</span><strong>{money(tx.amount, tx.currency)}</strong></div>)}</div>
         </section>
       ) : null}
+      {datasetId && runId && <VoiceAssistant context={{ domain: "bank", dataset_id: datasetId, run_id: runId, wallet_id: account }} resetKey={`bank-${datasetId}-${runId}`} onAction={assistantAction} />}
+      {decisionDraft && <DecisionConfirmation wallet={account} status={decisionDraft.status} onCancel={() => setDecisionDraft(null)} onConfirm={async note => { await api(`/api/analyses/${runId}/accounts/${encodeURIComponent(account)}/decision`, { method: "POST", body: JSON.stringify({ status: decisionDraft.status, note }) }); setDecisionDraft(null); await load(); }} />}
     </>
   );
 }
 
 function HoneypotView({ summary, runId, onInspect }: { summary: any; runId?: number; onInspect: () => void }) {
+  const [sessions,setSessions]=React.useState<any[]>([]),[selected,setSelected]=React.useState<number>(),[detail,setDetail]=React.useState<any>(),[name,setName]=React.useState("Payment portal decoy"),[profile,setProfile]=React.useState("payment_portal"),[eventType,setEventType]=React.useState("login_failure"),[source,setSource]=React.useState("test-client-01"),[target,setTarget]=React.useState("decoy-account"),[amount,setAmount]=React.useState(""),[note,setNote]=React.useState("Reviewed in the isolated honeypot laboratory"),[busy,setBusy]=React.useState(false),[error,setError]=React.useState("");
+  const refresh=React.useCallback(async(id?:number)=>{const rows=await api("/api/honeypot/sessions");setSessions(rows);const wanted=id||selected||rows[0]?.id;if(wanted){setSelected(wanted);setDetail(await api(`/api/honeypot/sessions/${wanted}`))}else setDetail(undefined)},[selected]);
+  React.useEffect(()=>{void refresh().catch(e=>setError(e.message))},[]);
+  async function createSession(){setBusy(true);setError("");try{const x=await api("/api/honeypot/sessions",{method:"POST",body:JSON.stringify({name,decoy_profile:profile})});await refresh(x.session.id)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
+  async function addEvent(){if(!selected)return;setBusy(true);setError("");try{const x=await api(`/api/honeypot/sessions/${selected}/events`,{method:"POST",body:JSON.stringify({event_type:eventType,source_alias:source,target_alias:target,amount:amount?Number(amount):null,currency:amount?"USD":null})});setDetail(x);await refresh(selected)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
+  async function changeStatus(status:string){if(!selected)return;setBusy(true);setError("");try{const x=await api(`/api/honeypot/sessions/${selected}/status`,{method:"POST",body:JSON.stringify({status,note})});setDetail(x);await refresh(selected)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
   return (
     <>
       <div className="page-title">
-        <div><span className="eyebrow teal">MADs / FINANCIAL INTELLIGENCE</span><h1>Honeypot lab</h1><p>A controlled replay environment for investigating suspicious networks.</p></div>
-        <button className="primary" onClick={onInspect}>Open network explorer</button>
+        <div><span className="eyebrow teal">MADs / DEFENSIVE DECEPTION</span><h1>Honeypot lab</h1><p>Persistent decoy sessions with live event scoring, evidence capture, and reporting.</p></div>
+        <div className="actions"><button className="secondary" onClick={onInspect}>Open network explorer</button>{selected&&<a className="primary report-link" href={`${API}/api/honeypot/sessions/${selected}/report`} target="_blank" rel="noreferrer"><Download/>Evidence report</a>}</div>
       </div>
-      <section className="simulation-banner"><ShieldCheck /><div><b>Controlled Honeypot Lab · Imported-data replay only</b><span>This view never redirects transactions, accesses banking systems, or interacts with real accounts.</span></div><strong>SIMULATION</strong></section>
+      <section className="simulation-banner"><ShieldCheck /><div><b>Working isolated honeypot · Safe defensive sandbox</b><span>Events are persisted, scored, audited, and reportable. The decoy never settles money or contacts an external account.</span></div><strong>ISOLATED</strong></section>
+      {error&&<div className="error"><AlertTriangle/>{error}</div>}
       <section className="metrics honeypot-metrics">
         {[
-          ["Analysis sessions", runId ? 1 : 0, Activity],
-          ["Events in selected case", summary?.dataset?.transaction_count || 0, Database],
-          ["Replay status", runId ? "Ready" : "Awaiting run", Eye],
+          ["Decoy sessions", sessions.length, Activity],
+          ["Captured events", detail?.session.event_count || 0, Database],
+          ["Session risk", detail?`${detail.session.risk_score}/100`:"—", AlertTriangle],
           ["Live integrations", 0, ShieldCheck],
-        ].map(([label, value, Icon]: any) => <article className="tilt-card" key={label}><div className="metric-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{label === "Live integrations" ? "No external systems" : "Current workspace only"}</small></article>)}
+        ].map(([label, value, Icon]: any) => <article className="tilt-card" key={label}><div className="metric-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{label === "Live integrations" ? "No external systems" : "Persisted in this workspace"}</small></article>)}
       </section>
       <section className="honeypot-grid">
-        <article className="panel session-list"><div className="panel-head"><div><h2>Replay session</h2><p>Current imported-data investigation</p></div></div><div className="active session-card"><ShieldCheck /><p><b>HP-{String(runId || 0).padStart(3, "0")}</b><span>{summary?.dataset?.name || "No dataset selected"}</span><small>{summary?.dataset?.transaction_count || 0} imported events</small></p></div></article>
-        <article className="panel radar-panel"><div className="panel-head"><div><span className="eyebrow">SESSION / HP-{String(runId || 0).padStart(3, "0")}</span><h2>{summary?.dataset?.name || "Awaiting dataset"}</h2></div><span className="status-pill">Local replay</span></div><div className="radar-visual" aria-label="Decorative replay analysis field"><i /><i /><i /><span><ShieldCheck /></span><b /><b /></div></article>
+        <article className="panel session-list"><div className="panel-head"><div><h2>Monitoring sessions</h2><p>Create and select isolated decoys</p></div></div><div className="honeypot-create"><input value={name} onChange={e=>setName(e.target.value)} aria-label="Session name"/><select value={profile} onChange={e=>setProfile(e.target.value)} aria-label="Decoy profile"><option value="payment_portal">Payment portal</option><option value="wallet_console">Wallet console</option><option value="kyc_portal">KYC portal</option></select><button className="primary" disabled={busy||name.trim().length<3} onClick={()=>void createSession()}><Plus/>Create session</button></div>{sessions.map(s=><button key={s.id} className={`session-card ${selected===s.id?"active":""}`} onClick={()=>void refresh(s.id)}><ShieldCheck/><p><b>HP-{String(s.id).padStart(3,"0")}</b><span>{s.name}</span><small>{s.event_count} events · {s.status}</small></p><strong>{s.risk_score}</strong></button>)}{!sessions.length&&<Empty text="Create the first isolated monitoring session."/>}</article>
+        <article className="panel honeypot-console"><div className="panel-head"><div><span className="eyebrow">{detail?`SESSION / HP-${String(detail.session.id).padStart(3,"0")}`:"NO SESSION SELECTED"}</span><h2>{detail?.session.name||"Create a decoy session"}</h2></div>{detail&&<span className={`status-pill ${detail.session.status}`}>{detail.session.status}</span>}</div>{detail?<><div className="event-composer"><h3>Inject a safe test event</h3><p>Use aliases only. This exercises the real capture, scoring, audit, and report pipeline.</p><select value={eventType} onChange={e=>setEventType(e.target.value)}><option value="login_failure">Login failure (+8)</option><option value="account_enumeration">Account enumeration (+18)</option><option value="transfer_attempt">Transfer attempt (+28)</option><option value="automation_signal">Automation signal (+22)</option><option value="privileged_action">Privileged action (+38)</option></select><input value={source} onChange={e=>setSource(e.target.value)} placeholder="Source alias"/><input value={target} onChange={e=>setTarget(e.target.value)} placeholder="Target decoy alias"/><input value={amount} onChange={e=>setAmount(e.target.value)} type="number" min="0" placeholder="Optional test amount (USD)"/><button className="primary" disabled={busy||detail.session.status==="closed"||!source.trim()} onClick={()=>void addEvent()}><Activity/>Capture event</button></div><div className="honeypot-status"><input value={note} onChange={e=>setNote(e.target.value)} aria-label="Status rationale"/><button disabled={busy||note.trim().length<10} onClick={()=>void changeStatus("monitoring")}>Monitor</button><button disabled={busy||note.trim().length<10} onClick={()=>void changeStatus("escalated")}>Escalate</button><button disabled={busy||note.trim().length<10} onClick={()=>void changeStatus("closed")}>Close</button></div><div className="event-stream"><h3>Captured evidence</h3>{detail.events.map((e:any)=><article key={e.id}><i className={e.severity.toLowerCase()}/><div><b>{e.event_type.replaceAll("_"," ")}</b><span>{e.source_alias} → {e.target_alias}</span><p>{e.reason}</p><small>{new Date(e.created_at).toLocaleString()}</small></div><strong>+{e.contribution}</strong></article>)}{!detail.events.length&&<Empty text="No events captured. Inject a safe test event above."/>}</div></>:<Empty text="Create or select a session to begin monitoring."/>}</article>
       </section>
     </>
   );
@@ -1279,18 +1488,14 @@ function HoneypotView({ summary, runId, onInspect }: { summary: any; runId?: num
 
 function SettingsView() {
   const [value, setValue] = React.useState<any>(),
-    [saved, setSaved] = React.useState("");
+    [saved, setSaved] = React.useState(""),[error,setError]=React.useState("");
   React.useEffect(() => {
     api("/api/settings").then(setValue);
   }, []);
   if (!value) return <Empty text="Loading detection settings…" />;
   async function save() {
-    const r = await api("/api/settings", {
-      method: "POST",
-      body: JSON.stringify({ config: value.config }),
-    });
-    setValue(r);
-    setSaved(`Version ${r.version} saved. New analyses will use it.`);
+    setError("");setSaved("");
+    try{const r = await api("/api/settings", {method: "POST",body: JSON.stringify({ config: value.config })});setValue(r);setSaved(`Version ${r.version} saved. New analyses will use it.`);}catch(e){setError((e as Error).message)}
   }
   return (
     <>
@@ -1307,13 +1512,19 @@ function SettingsView() {
         </button>
       </div>
       {saved && <div className="success">{saved}</div>}
+      {error && <div className="error"><AlertTriangle/>{error}</div>}
+      <div className="simulation-banner"><ShieldCheck/><div><b>Strict, versioned detector parameters</b><span>Invalid ranges are rejected by the API. Medium risk must remain below high risk. Historical reports retain the exact settings version used.</span></div></div>
       <section className="settings-grid">
-        {Object.entries(value.config).map(([k, v]) => (
+        {Object.entries(value.config).map(([k, v]) => {
+          const limits:any={fan_window_minutes:[1,1440],fan_min_senders:[2,100],fan_min_receivers:[1,100],fan_share:[0.1,1],cycle_window_hours:[1,720],cycle_max_length:[3,8],chain_window_minutes:[1,1440],chain_min_share:[0.1,1],new_account_days:[1,3650],shared_min_accounts:[2,100],medium_risk_score:[1,99],high_risk_score:[2,100]};
+          return (
           <label className="setting" key={k}>
             <span>{k.replaceAll("_", " ")}</span>
+            <small>Allowed: {limits[k]?.[0]}–{limits[k]?.[1]}</small>
             <input
               type="number"
               step={String(v).includes(".") ? "0.05" : "1"}
+              min={limits[k]?.[0]} max={limits[k]?.[1]}
               value={v as any}
               onChange={(e) =>
                 setValue({
@@ -1323,7 +1534,7 @@ function SettingsView() {
               }
             />
           </label>
-        ))}
+        )})}
       </section>
     </>
   );

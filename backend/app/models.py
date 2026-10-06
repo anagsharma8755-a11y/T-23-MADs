@@ -124,3 +124,29 @@ class BlockchainDecision(Base):
     note: Mapped[str|None]=mapped_column(Text,nullable=True)
     user_id: Mapped[int]=mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+
+class HoneypotSession(Base):
+    __tablename__="honeypot_sessions"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    workspace_id: Mapped[int]=mapped_column(ForeignKey("workspaces.id"),index=True)
+    name: Mapped[str]=mapped_column(String(180))
+    decoy_profile: Mapped[str]=mapped_column(String(40),default="payment_portal")
+    status: Mapped[str]=mapped_column(String(30),default="monitoring",index=True)
+    risk_score: Mapped[int]=mapped_column(Integer,default=0)
+    event_count: Mapped[int]=mapped_column(Integer,default=0)
+    created_by: Mapped[int]=mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+    updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+
+class HoneypotEvent(Base):
+    __tablename__="honeypot_events"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    session_id: Mapped[int]=mapped_column(ForeignKey("honeypot_sessions.id",ondelete="CASCADE"),index=True)
+    event_type: Mapped[str]=mapped_column(String(40),index=True)
+    source_alias: Mapped[str]=mapped_column(String(120))
+    target_alias: Mapped[str]=mapped_column(String(120))
+    severity: Mapped[str]=mapped_column(String(20))
+    contribution: Mapped[int]=mapped_column(Integer)
+    reason: Mapped[str]=mapped_column(Text)
+    metadata_json: Mapped[dict]=mapped_column(JSON,default=dict)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)

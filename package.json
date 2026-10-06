@@ -1,0 +1,7 @@
+{
+  "name": "t-23-mads",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix frontend ci && npm --prefix frontend run build"
+  }
+}

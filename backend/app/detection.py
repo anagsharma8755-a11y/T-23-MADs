@@ -4,7 +4,7 @@ from decimal import Decimal
 import hashlib, json
 import networkx as nx
 
-DEFAULTS={"fan_window_minutes":15,"fan_min_senders":3,"fan_min_receivers":2,"fan_share":0.8,"cycle_window_hours":24,"cycle_max_length":5,"chain_window_minutes":20,"chain_min_share":0.8,"new_account_days":30,"shared_min_accounts":3}
+DEFAULTS={"fan_window_minutes":15,"fan_min_senders":3,"fan_min_receivers":2,"fan_share":0.8,"cycle_window_hours":24,"cycle_max_length":5,"chain_window_minutes":20,"chain_min_share":0.8,"new_account_days":30,"shared_min_accounts":3,"medium_risk_score":30,"high_risk_score":60}
 CAPS={"rapid_fan":40,"circular":35,"pass_through":35,"shared_attribute":15}
 def fprint(d): return hashlib.sha256(json.dumps(d,sort_keys=True,default=str).encode()).hexdigest()
 def finding(detector,accounts,txs,currency,evidence,reason,limits,contribution):
@@ -87,13 +87,14 @@ def analyze(txs,accounts,config=None):
                     out.append(finding("shared_attribute",ids,[],None,{"attribute_type":field,"attribute_value":value,"account_count":len(ids),"new_account_days":c["new_account_days"]},f"{len(ids)} recently created accounts share the same {label} ({value}).",["Shared attributes can be legitimate; this detector has a deliberately limited score contribution."],min(CAPS["shared_attribute"],5+len(ids)*2)))
     return out
 
-def score_findings(findings):
+def score_findings(findings, config=None):
+    c={**DEFAULTS,**(config or {})}
     per=defaultdict(lambda:defaultdict(int)); ids=defaultdict(list)
     for idx,f in enumerate(findings):
         for account in f["account_ids"]:
             per[account][f["detector"]]=max(per[account][f["detector"]],f["contribution"]); ids[account].append(idx)
     result={}
     for acct,parts in per.items():
-        bounded={k:min(v,CAPS[k]) for k,v in parts.items()}; score=min(100,sum(bounded.values())); severity="High" if score>=60 else "Medium" if score>=30 else "Low"
+        bounded={k:min(v,CAPS[k]) for k,v in parts.items()}; score=min(100,sum(bounded.values())); severity="High" if score>=c["high_risk_score"] else "Medium" if score>=c["medium_risk_score"] else "Low"
         result[acct]={"score":score,"severity":severity,"breakdown":bounded,"finding_indexes":ids[acct]}
     return result

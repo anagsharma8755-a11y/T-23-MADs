@@ -29,6 +29,7 @@ def validate_transactions(raw: bytes,max_rows=100000):
     fields,source=read_csv(raw,max_rows); errors=[]; result=[]; seen=set()
     missing=[c for c in TX_REQUIRED if c not in fields]
     if missing: return [],[{"row":1,"message":"Missing columns: "+", ".join(missing)}]
+    if not source: return [],[{"row":1,"message":"CSV must contain at least one transaction row"}]
     for n,r in source:
         try:
             for f in TX_REQUIRED:

@@ -22,7 +22,12 @@ MADs (Mule Account Detection System) is a working fraud-investigation applicatio
 - Interactive React Flow account and wallet/transaction graphs with bounded neighborhood expansion.
 - Capability-gated blockchain detectors that never invent timestamps, edge amounts, balances, IPs, devices, or KYC data.
 - Persistent analyst decisions, evidence reports, CSV/JSON exports, settings versioning, and immutable audit history.
+- Automatic full CSV analysis after import, with atomic rejection and row-level reasons when validation fails.
+- Clickable real-data metrics that open paginated source transactions or every flagged account's detector explanation.
+- Strict versioned detector and severity thresholds with server-enforced ranges and preserved historical settings.
+- A consolidated printable report covering every flagged account, supporting evidence, analyst status, and detailed-report links.
 - Supervisor authentication, workspace isolation, CSRF protection, idempotent imports, and responsive 3D motion with reduced-motion support.
+- Push-to-talk or typed investigation assistant with deterministic command fallback, bounded authorized tools, evidence links, request cancellation, and explicit decision confirmation.
 
 ## Figma and 3D interface
 
@@ -51,6 +56,20 @@ npm run dev
 ```
 
 Open http://localhost:5173 and sign in, or create a new workspace at `/signup`. Unknown routes render the animated MADs 404 page. API docs are at http://localhost:8000/docs.
+
+### ElevenLabs voice narration and transcription
+
+Typed assistant commands work without any AI credential. To enable microphone transcription, keep the API key on the backend and set:
+
+```env
+SPEECH_PROVIDER=openai
+SPEECH_API_KEY=replace-with-a-server-side-key
+SPEECH_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+```
+
+The assistant opens after login and narrates a concise product tour. With `SPEECH_PROVIDER=elevenlabs`, the backend uses ElevenLabs Scribe for push-to-talk transcription and ElevenLabs text-to-speech for replies. MADs limits recording duration and size, does not retain raw audio, and never exposes the API key to Vite. Microphone access is still requested only after pressing the push-to-talk control; the welcome narration never activates the microphone.
+
+Copy the ElevenLabs settings from `.env.example` into `backend/.env`, set `ELEVENLABS_API_KEY`, and restart the API. `ELEVENLABS_VOICE_ID`, `ELEVENLABS_TTS_MODEL`, and `ELEVENLABS_STT_MODEL` can be changed without rebuilding the frontend. If the key is absent, the UI remains usable with typed commands and the browser's local speech voice.
 
 ## Dataset / API Information
 
@@ -107,9 +126,9 @@ Neo4j stores `(Account)-[:TRANSFER]->(Account)` relationships and powers one- an
 - FastAPI + Pandas + NetworkX for ingestion and deterministic detection
 - PostgreSQL + SQLAlchemy for users, datasets, findings, reviews, and audit history
 - Neo4j for account relationships and graph neighborhood queries
-- Vercel for the frontend and Render for the API/PostgreSQL
+- Vercel Functions for the same-origin React/FastAPI deployment and Supabase Postgres for durable production data
 
-For deployment, point the Vercel project root to `frontend`, set `VITE_API_URL` to the Render API URL, and set the Render `CORS_ORIGINS` value to the Vercel origin. The included `render.yaml` provisions the API and PostgreSQL; supply Neo4j Aura connection values for `NEO4J_URI`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD`.
+The root `vercel.json` builds the Vite frontend and routes `/api/*` to the FastAPI ASGI function. Production uses same-origin requests, secure cookies, a private `mads` Postgres schema, Supabase transaction pooling, and encrypted Vercel environment variables. Never create a `VITE_` variable for `DATABASE_URL`, `SECRET_KEY`, or speech-provider credentials: `VITE_` values are embedded into browser bundles. The legacy `render.yaml` remains available for self-hosted/container deployments.
 
 ## Detection method
 
@@ -154,16 +173,26 @@ The primary demo runs at `http://localhost:5173/app` after completing the setup 
 6. Refresh to show persistence, then open the printable report and export CSV/JSON.
 7. Open **Elliptic++ Bitcoin** to show the real bounded blockchain subset and capability gating, then show **Detection settings** and **Audit history**.
 
+### 60-second voice-assistant demo
+
+1. Open **Elliptic++ Bitcoin** or **Network explorer**, then press **Voice assistant**.
+2. Say or type “Show high-risk wallets,” review the editable transcript, and submit it to filter the real investigation queue.
+3. Say “Open wallet …” and use the on-screen identifier picker if speech produced an ambiguous partial address.
+4. Ask “Why was this wallet flagged?” to show the automated score, reasons, limitations, and clickable evidence references.
+5. Ask “Expand this network,” then “Show the supporting transactions” to update the bounded graph and open its evidence panel.
+6. Ask “Summarize this investigation” for an evidence-grounded case summary that keeps dataset labels, automated findings, and analyst decisions separate.
+7. Say “Confirm suspicious.” MADs opens the exact wallet and proposed decision, but requires a written analyst note and an explicit on-screen confirmation before saving to the audit trail.
+
 ## Architecture / Workflow
 
 `CSV files → Pandas validation → PostgreSQL/SQLite storage → NetworkX detectors → Neo4j/SQL neighborhood expansion → FastAPI → React dashboard and evidence reports`
 
-React/Vite calls a FastAPI service with HttpOnly server-side sessions, double-submit CSRF validation, Argon2 password hashing, and workspace-scoped SQLAlchemy queries. React Flow renders the Neo4j-backed account network; Recharts renders real run aggregates. Analysis runs outside upload requests through database-backed job state, and interrupted work is marked safely retryable on restart.
+React/Vite calls a FastAPI service with HttpOnly server-side sessions, double-submit CSRF validation, Argon2 password hashing, and workspace-scoped SQLAlchemy queries. React Flow renders the Neo4j-backed account network; Recharts renders real run aggregates. Local analysis uses FastAPI background execution; Vercel completes each bounded analysis inside the function invocation so work is not lost when a serverless instance is frozen.
 
 ## Limitations & Future Scope
 
 - SQLite is intended for a single-laptop demo; PostgreSQL and Neo4j are recommended for team or deployed environments.
-- The lightweight build uses FastAPI background execution. A multi-instance deployment should use a database-claiming worker queue.
+- Vercel analysis is intentionally bounded by the function duration and request-size limits. Large production imports should use object storage plus a database-claiming worker queue.
 - Public research datasets do not contain every field used by production banks. Detectors are disabled when timestamps, edge values, balances, device IDs, IPs, or KYC attributes are unavailable.
 - MADs makes no FX conversion, identity conclusion, calibrated fraud-probability claim, or complete account-balance claim.
 - Future work includes streaming ingestion, case collaboration, stronger entity resolution, model-assisted prioritization with temporal validation, and production observability.
